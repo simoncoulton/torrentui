@@ -6,6 +6,7 @@ mod daemon;
 mod desktop;
 mod engine;
 mod fmt;
+mod macos;
 mod proto;
 mod tags;
 mod theme;

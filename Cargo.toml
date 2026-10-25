@@ -2,6 +2,16 @@
 name = "torrentui"
 version = "0.1.0"
 edition = "2024"
+description = "A terminal BitTorrent client with a background daemon, tags, and post-download actions"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/simoncoulton/torrentui"
+homepage = "https://github.com/simoncoulton/torrentui"
+keywords = ["bittorrent", "torrent", "tui", "terminal", "magnet"]
+categories = ["command-line-utilities"]
+# let-chains (1.88) and File::try_lock (1.89)
+rust-version = "1.89"
+exclude = [".github/", "packaging/"]
 
 [dependencies]
 clap = { version = "4.6.7", features = ["derive"] }
@@ -15,3 +25,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 serde_yaml_ng = "0.10.0"
 tokio = { version = "1.54.1", features = ["full"] }
+
+[profile.release]
+lto = "thin"
+strip = true

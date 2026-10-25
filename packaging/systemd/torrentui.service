@@ -1,0 +1,14 @@
+[Unit]
+Description=torrentui BitTorrent daemon
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/torrentui daemon run
+Restart=on-failure
+# Let post-download actions finish if the daemon is stopped.
+KillMode=process
+TimeoutStopSec=60
+
+[Install]
+WantedBy=default.target

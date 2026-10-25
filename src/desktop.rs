@@ -21,6 +21,9 @@ fn escape_markup(s: &str) -> String {
 /// Show a desktop notification via `notify-send`, if it is installed.
 /// Best effort and non-blocking; needs a Tokio runtime.
 pub fn notify(summary: &str, body: &str) {
+    if IS_MACOS {
+        return crate::macos::notify(summary, body);
+    }
     let mut cmd = tokio::process::Command::new("notify-send");
     cmd.args(["--app-name=torrentui", "--"])
         .arg(summary)
@@ -35,6 +38,8 @@ pub fn notify(summary: &str, body: &str) {
         });
     }
 }
+
+const IS_MACOS: bool = cfg!(target_os = "macos");
 
 const HANDLER_FILE: &str = "torrentui-open.desktop";
 const LAUNCHER_FILE: &str = "torrentui.desktop";
@@ -66,6 +71,9 @@ fn find_in_path(name: &str) -> Option<PathBuf> {
 /// A terminal emulator command prefix: `$TERMINAL` if set and installed,
 /// else the first known one found on `PATH`.
 pub fn detect_terminal() -> Option<Vec<String>> {
+    if IS_MACOS {
+        return Some(crate::macos::default_terminal());
+    }
     let args_for = |name: &str| -> Vec<String> {
         TERMINALS
             .iter()
@@ -189,12 +197,31 @@ fn applications_dir() -> Result<PathBuf> {
         .join("applications"))
 }
 
+/// The path to record in desktop entries and service files. The running
+/// binary's own path may be versioned (Homebrew's `Cellar/torrentui/0.1.0/...`)
+/// and vanish on upgrade, so prefer a `PATH` entry that resolves to the same
+/// file (`/opt/homebrew/bin/torrentui`, `/usr/bin/torrentui`, ...).
+pub(crate) fn stable_exe(exe: &Path, path_var: &std::ffi::OsStr) -> PathBuf {
+    let Ok(real) = fs::canonicalize(exe) else {
+        return exe.to_path_buf();
+    };
+    let Some(name) = exe.file_name() else {
+        return exe.to_path_buf();
+    };
+    std::env::split_paths(path_var)
+        .filter(|d| d.is_absolute())
+        .map(|d| d.join(name))
+        .find(|candidate| fs::canonicalize(candidate).is_ok_and(|c| c == real))
+        .unwrap_or_else(|| exe.to_path_buf())
+}
+
 fn exe_str() -> Result<String> {
-    Ok(std::env::current_exe()
-        .wrap_err("cannot find the torrentui executable")?
+    let exe = std::env::current_exe().wrap_err("cannot find the torrentui executable")?;
+    let path_var = std::env::var_os("PATH").unwrap_or_default();
+    stable_exe(&exe, &path_var)
         .to_str()
-        .ok_or_else(|| eyre!("the executable path is not valid UTF-8"))?
-        .to_string())
+        .ok_or_else(|| eyre!("the executable path is not valid UTF-8"))
+        .map(String::from)
 }
 
 fn current_default(mime: &str) -> Option<String> {
@@ -228,6 +255,11 @@ pub struct RegisterOpts {
 /// Make torrentui the handler for magnet links and .torrent files.
 /// Returns lines describing what was done.
 pub fn register(opts: &RegisterOpts) -> Result<Vec<String>> {
+    if IS_MACOS {
+        // Only an explicitly requested terminal is written into the handler;
+        // otherwise one is detected each time it is needed.
+        return crate::macos::register(&exe_str()?, opts.ui, opts.terminal.as_deref());
+    }
     if find_in_path("xdg-mime").is_none() {
         bail!(
             "xdg-mime was not found (install xdg-utils). By hand: install the .desktop \
@@ -298,6 +330,9 @@ pub fn register(opts: &RegisterOpts) -> Result<Vec<String>> {
 /// Remove the desktop entries. `xdg-mime` has no way to clear a default, but
 /// one that names a missing file is ignored.
 pub fn unregister() -> Result<Vec<String>> {
+    if IS_MACOS {
+        return crate::macos::unregister();
+    }
     let dir = applications_dir()?;
     let mut done = Vec::new();
     for file in [HANDLER_FILE, LAUNCHER_FILE] {
@@ -349,6 +384,9 @@ fn systemctl(args: &[&str]) -> bool {
 }
 
 pub fn install_service() -> Result<Vec<String>> {
+    if IS_MACOS {
+        return crate::macos::install_service(&exe_str()?, &crate::proto::daemon_log_path()?);
+    }
     let path = service_path()?;
     fs::create_dir_all(path.parent().expect("has parent"))?;
     fs::write(&path, service_unit(&exe_str()?)?)?;
@@ -364,6 +402,9 @@ pub fn install_service() -> Result<Vec<String>> {
 }
 
 pub fn uninstall_service() -> Result<Vec<String>> {
+    if IS_MACOS {
+        return crate::macos::uninstall_service();
+    }
     let path = service_path()?;
     let mut done = Vec::new();
     if path.exists() {
@@ -440,5 +481,33 @@ mod tests {
     fn terminal_text_is_split() {
         assert_eq!(parse_terminal(" ghostty  -e ").unwrap(), ["ghostty", "-e"]);
         assert!(parse_terminal("  ").is_err());
+    }
+
+    #[test]
+    fn stable_exe_prefers_a_path_entry_for_the_same_file() {
+        use std::os::unix::fs::symlink;
+        let base = std::env::temp_dir().join(format!("torrentui-stable-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let cellar = base.join("Cellar/torrentui/0.1.0/bin");
+        let bin = base.join("bin");
+        let other = base.join("other");
+        for d in [&cellar, &bin, &other] {
+            fs::create_dir_all(d).unwrap();
+        }
+        let real = cellar.join("torrentui");
+        fs::write(&real, "x").unwrap();
+        symlink(&real, bin.join("torrentui")).unwrap();
+        // A different file with the same name must not be mistaken for it.
+        fs::write(other.join("torrentui"), "y").unwrap();
+
+        let path = std::env::join_paths([&other, &bin]).unwrap();
+        assert_eq!(stable_exe(&real, &path), bin.join("torrentui"));
+        // Nothing on PATH matches: keep the real path.
+        let none = std::env::join_paths([&other]).unwrap();
+        assert_eq!(stable_exe(&real, &none), real);
+        // Relative PATH entries are ignored.
+        let rel = std::ffi::OsString::from("bin");
+        assert_eq!(stable_exe(&real, &rel), real);
+        let _ = fs::remove_dir_all(&base);
     }
 }

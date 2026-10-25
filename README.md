@@ -3,6 +3,22 @@
 A terminal BitTorrent client built on [ratatui](https://ratatui.rs) and the
 [librqbit](https://crates.io/crates/librqbit) engine.
 
+## Install
+
+Requires Rust 1.89 or newer.
+
+```
+cargo install --git https://github.com/simoncoulton/torrentui   # or, from a checkout:
+cargo install --path .                                          # installs ~/.cargo/bin/torrentui
+```
+
+Prebuilt Linux and macOS (Intel and Apple Silicon) binaries are attached to each
+[GitHub release](https://github.com/simoncoulton/torrentui/releases); unpack the
+archive and put `torrentui` on your `PATH`. Linux and macOS are supported; there
+is no Windows version.
+
+## Usage
+
 ```
 torrentui [OPTIONS] [MAGNET_OR_TORRENT ...]    open the terminal UI
 
@@ -60,19 +76,21 @@ running your [post-download actions](#actions-after-a-download).
 - `-d` and `--all-files` apply when the command starts the daemon; if it is
   already running with other settings you get an error telling you to
   `torrentui daemon restart` with them.
-- `torrentui daemon install-service` writes a systemd user unit, then
-  `systemctl --user enable --now torrentui` runs the daemon at login. Stop a
-  daemon you started by hand first. The unit uses `KillMode=process` so a
-  running action isn't killed when the service stops.
+- `torrentui daemon install-service` writes a systemd user unit (a launchd agent
+  on macOS), then `systemctl --user enable --now torrentui` runs the daemon at
+  login. Stop a daemon you started by hand first. The unit uses `KillMode=process`
+  so a running action isn't killed when the service stops.
 - The daemon listens only on a unix socket, `$XDG_RUNTIME_DIR/torrentui/daemon.sock`
   (the directory is mode 0700, the socket 0600, and each connection's user is
   checked), never on a network port. Its stderr goes to
-  `~/.local/share/torrentui/daemon.log`.
+  `<data>/torrentui/daemon.log`, where `<data>` is `~/.local/share` on Linux and
+  `~/Library/Application Support` on macOS (see [Where data lives](#where-data-lives)).
 
 ## Magnet links from the browser
 
 Clicking a magnet link (or a `.torrent` link) in your browser can add it to
-torrentui automatically. This is Linux/XDG only.
+torrentui automatically. On Linux this uses a desktop entry and `xdg-mime`; on
+macOS it builds a small handler app. [macOS notes](#macos) are below.
 
 ### Setup
 
@@ -97,7 +115,7 @@ torrentui automatically. This is Linux/XDG only.
    it did. If another application already handles magnet links it stops and
    tells you which; add `--force` to replace it.
 
-3. **Check it:**
+3. **Check it** (Linux; on macOS just click a magnet link):
 
    ```
    xdg-mime query default x-scheme-handler/magnet    # torrentui-open.desktop
@@ -141,6 +159,38 @@ torrentui automatically. This is Linux/XDG only.
 - `torrentui open` also takes `.torrent` file paths and `file://` URLs, which is
   how the file manager and browsers pass downloaded `.torrent` files.
 
+### macOS
+
+`torrentui register` works differently on a Mac, because a URL scheme there is
+handled by an app bundle rather than a `.desktop` file and `xdg-mime`:
+
+- It builds `~/Applications/torrentui.app`: a tiny AppleScript applet (made with
+  `osacompile`, so it needs nothing installed) that receives magnet links and
+  `.torrent` files and passes them to `torrentui open`. The app is ad-hoc signed
+  and registered with LaunchServices, has no Dock icon, and does nothing if you
+  open it directly.
+- If only torrentui claims `magnet:` links, macOS uses it automatically. If you
+  have another torrent client, macOS has no built-in way to choose between them;
+  install [`duti`](https://github.com/moretension/duti) (`brew install duti`) and
+  re-run `torrentui register`, which then sets the default for `magnet` and
+  `.torrent`. Otherwise use the other client's own setting, or Finder > Get Info
+  on a `.torrent` file > Open with > torrentui > Change All….
+- `--force` has no effect on macOS (there is no existing default to check).
+- Notifications use `osascript`. The first time, macOS may ask, or you may have
+  to allow notifications for *Script Editor* in System Settings > Notifications.
+- `--ui` opens `Terminal.app` by default. To use another terminal pass a command
+  that takes the program to run as its last argument, for example
+  `--terminal "open -na Ghostty --args -e"`.
+- If `torrentui` lives in a versioned location (Homebrew's `Cellar`), the path
+  recorded is the stable one on your `PATH` (such as `/opt/homebrew/bin`), so it
+  survives upgrades.
+- The first run may trigger a "find devices on your local network" prompt, which
+  BitTorrent's local peer discovery uses. Allowing it is optional.
+- `torrentui daemon install-service` writes a launchd agent
+  (`~/Library/LaunchAgents/com.torrentui.daemon.plist`); start it with the
+  `launchctl bootstrap gui/$(id -u) <that file>` command it prints. With
+  Homebrew, `brew services start torrentui` does the same.
+
 ### Troubleshooting
 
 | Symptom | Check |
@@ -148,8 +198,9 @@ torrentui automatically. This is Linux/XDG only.
 | Nothing happens on click | `xdg-open 'magnet:?xt=urn:btih:…'` in a terminal. If that works, the problem is the browser's own handler setting (step 4). |
 | `xdg-mime query default …` shows another app | Run `torrentui register --force`. |
 | It stopped working after moving or rebuilding the binary | The `.desktop` file holds the old path. Run `torrentui register --force` again from the new location. |
-| `xdg-mime was not found` | Install `xdg-utils`. |
-| Link accepted but no torrent appears | `torrentui daemon status`, and read `~/.local/share/torrentui/daemon.log` and the notification text. With `ask_files: true` a multi-file torrent is waiting for you to choose files in a window. |
+| `xdg-mime was not found` (Linux) | Install `xdg-utils`. |
+| Nothing happens on a Mac | Run `torrentui open 'magnet:?xt=urn:btih:…'` in Terminal. If that works, the handler app is the problem: re-run `torrentui register` (also needed if you moved the binary). |
+| Link accepted but no torrent appears | `torrentui daemon status`, and read `<data>/torrentui/daemon.log` and the notification text. With `ask_files: true` a multi-file torrent is waiting for you to choose files in a window. |
 | No notifications | Install `libnotify` (`notify-send`), or check your desktop's notification settings. |
 
 ### Removing it
@@ -176,7 +227,7 @@ clears it, and the speed totals in the header still cover every torrent. Tags
 show in the Details pane, and as a column when the terminal is at least 110
 columns wide.
 
-Tags are stored by info-hash in `~/.local/share/torrentui/tags.yml`, so they
+Tags are stored by info-hash in `<data>/torrentui/tags.yml`, so they
 survive restarts and renumbering, and are dropped when you remove the torrent.
 The file is plain YAML and safe to edit by hand while torrentui is closed;
 invalid tags in it are a startup error naming the offending torrent rather than
@@ -223,7 +274,7 @@ on_complete:
   `-`.
 - Matching actions run one after another in config order; a failure doesn't
   stop the rest. The footer shows `[running N action(s)…]`, then the result.
-  Output and exit status are appended to `~/.local/share/torrentui/actions.log`
+  Output and exit status are appended to `<data>/torrentui/actions.log`
   (rotated at 1 MiB).
 - Actions fire once when a download that torrentui saw in progress finishes. A
   torrent that was already complete when you started or added it does not fire;
@@ -278,16 +329,23 @@ Colour keys: `bg fg muted accent border selection_bg success info warning error 
 `special` = checking). Set `bg: reset` to keep your terminal's background.
 
 ## Where data lives
+
+The config is always `~/.config/torrentui/config.yml` (honouring
+`$XDG_CONFIG_HOME`), including on macOS. Other files below use the platform's
+data directory: `~/.local/share` on Linux (honouring `$XDG_DATA_HOME`) and
+`~/Library/Application Support` on macOS, written as `<data>` here.
+
 - Daemon socket and lock: `$XDG_RUNTIME_DIR/torrentui/` (else
-  `~/.local/share/torrentui/run/`); daemon stderr: `~/.local/share/torrentui/daemon.log`
+  `<data>/torrentui/run/`); daemon stderr: `<data>/torrentui/daemon.log`
 - Config: `~/.config/torrentui/config.yml`
-- Torrent list and resume data: `~/.local/share/torrentui/sessions/`
-  (honours `$XDG_DATA_HOME`). Older installs kept this in
-  `~/.local/share/com.rqbit.session`; it is moved automatically on first start.
-- Tags: `~/.local/share/torrentui/tags.yml`
-- Action log and bookkeeping: `~/.local/share/torrentui/actions.log`,
+- Torrent list and resume data: `<data>/torrentui/sessions/`. Older installs
+  kept this in the engine's own `com.rqbit.session` folder under `<data>`; it is
+  moved automatically on first start.
+- Tags: `<data>/torrentui/tags.yml`
+- Action log and bookkeeping: `<data>/torrentui/actions.log`,
   `pending-actions.yml` (downloads awaiting their actions)
-- DHT routing cache: `~/.cache/com.rqbit.dht/` (disposable)
+- DHT routing cache: the engine's own `com.rqbit.dht` folder in your cache
+  directory (disposable)
 
 ## Layout
 - `config.rs` – YAML config, speed-limit parsing, comment-preserving edits
@@ -299,7 +357,8 @@ Colour keys: `bg fg muted accent border selection_bg success info warning error 
 - `proto.rs` – the daemon/client wire protocol and socket locations
 - `daemon.rs` – the background process: owns the session, tags and actions
 - `client.rs` – connecting to (and starting) the daemon
-- `desktop.rs` – magnet-link registration, notifications, systemd unit
+- `desktop.rs` – magnet-link registration, notifications, systemd unit (Linux)
+- `macos.rs` – the same for macOS: handler app, notifications, launchd agent
 - `app.rs` – state + key handling (pure, unit-tested)
 - `ui.rs` – rendering only (tested with ratatui's `TestBackend`)
 - `tui.rs` – the window's event loop
