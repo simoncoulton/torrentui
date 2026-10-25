@@ -44,6 +44,16 @@ pub fn bar(pct: f64, width: usize) -> String {
     format!("{}{}", "█".repeat(filled), "░".repeat(width - filled))
 }
 
+/// `45s`, `3m 05s`, `2h 10m`, `4d 3h`.
+pub fn duration(secs: u64) -> String {
+    match secs {
+        0..=59 => format!("{secs}s"),
+        60..=3599 => format!("{}m {:02}s", secs / 60, secs % 60),
+        3600..=86_399 => format!("{}h {:02}m", secs / 3600, secs % 3600 / 60),
+        _ => format!("{}d {}h", secs / 86_400, secs % 86_400 / 3600),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -77,5 +87,14 @@ mod tests {
         }
         assert_eq!(bar(100.0, 4), "████");
         assert_eq!(bar(0.0, 4), "░░░░");
+    }
+
+    #[test]
+    fn formats_durations() {
+        assert_eq!(duration(0), "0s");
+        assert_eq!(duration(59), "59s");
+        assert_eq!(duration(185), "3m 05s");
+        assert_eq!(duration(7800), "2h 10m");
+        assert_eq!(duration(90_000), "1d 1h");
     }
 }
