@@ -411,21 +411,11 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
                 1,
             ),
             ("f", "files", 1),
-            (
-                "F",
-                if app.file_panel {
-                    "hide panel"
-                } else {
-                    "file panel"
-                },
-                1,
-            ),
             ("t", "tags", 1),
             ("/", "filter", 1),
             ("d", "remove", 1),
             ("x", "actions", 1),
             ("l", "limits", 2),
-            ("T", "theme", 2),
             ("q", "quit", 0),
             ("Q", "quit + daemon", 2),
             ("?", "help", 0),
@@ -438,7 +428,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         }
         // These act on the selected torrent, so they mean nothing without one.
         if app.current().is_none() {
-            hints.retain(|h| !matches!(h.0, "p" | "f" | "F" | "t" | "d" | "x"));
+            hints.retain(|h| !matches!(h.0, "p" | "f" | "t" | "d" | "x"));
         }
         let badge = actions_badge(t, app);
         let badge_w: usize = badge.iter().map(|s| s.content.chars().count()).sum();
@@ -1350,7 +1340,7 @@ mod tests {
                 .to_string()
         };
         let wide = last(120, 30);
-        for k in ["add", "tags", "filter", "theme", "limits", "help", "quit"] {
+        for k in ["add", "tags", "filter", "limits", "help", "quit"] {
             assert!(wide.contains(k), "{wide}");
         }
         let narrow = last(60, 30);
@@ -1435,7 +1425,7 @@ mod tests {
         let mut app = App::new("/dl".into());
         let footer = |app: &App| render(app, 120, 30).lines().last().unwrap().to_string();
         let empty = footer(&app);
-        assert!(empty.contains("a add") && empty.contains("T theme") && empty.contains("? help"));
+        assert!(empty.contains("a add") && empty.contains("l limits") && empty.contains("? help"));
         for gone in ["pause", "files", "tags", "remove"] {
             assert!(
                 !empty.contains(gone),
@@ -1496,7 +1486,6 @@ mod tests {
         assert!(out.contains("a/movie.mkv") && out.contains("50%"), "{out}");
         assert!(out.contains("a/subs.srt") && out.contains("100%"), "{out}");
         assert!(out.contains("a/extra.nfo") && out.contains("skip"), "{out}");
-        assert!(out.contains("hide panel"));
 
         // Too narrow for a panel: the list keeps the room.
         assert!(!render(&app, 80, 30).contains("a/movie.mkv"));

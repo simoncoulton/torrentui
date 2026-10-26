@@ -3,6 +3,11 @@
 A terminal BitTorrent client built on [ratatui](https://ratatui.rs) and the
 [librqbit](https://crates.io/crates/librqbit) engine.
 
+![torrentui demo: adding Big Buck Bunny and Sintel, the file picker, per-file progress, tags, pause and themes](docs/demo.gif)
+
+The demo downloads two of the free, freely licensed films from
+[webtorrent.io/free-torrents](https://webtorrent.io/free-torrents).
+
 ## Install
 
 Requires Rust 1.89 or newer.
