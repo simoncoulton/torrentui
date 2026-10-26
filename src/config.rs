@@ -23,8 +23,10 @@ pub const DEFAULT_CONFIG: &str = "\
 # Where new torrents are saved. Accepts ~ . Default: your Downloads folder.
 # download_dir: ~/Downloads
 
-# Colour theme: default, tokyo-night, catppuccin-frappe, catppuccin-mocha,
-# dracula, one-dark, or the name of a theme defined under `themes:` below.
+# Colour theme: default, tokyo-night, catppuccin-frappe, catppuccin-macchiato,
+# catppuccin-mocha, catppuccin-latte, dracula, one-dark, gruvbox-dark, nord,
+# solarized-dark, rose-pine, monokai, github-dark, everforest, kanagawa, or the
+# name of a theme defined under `themes:` below.
 # Everything except `default` uses 24-bit colour.  Press `t` in the app to
 # preview and pick a theme; the choice is saved here.
 theme: default
@@ -43,6 +45,16 @@ dht: true
 # Offer a file picker for multi-file torrents before downloading.
 ask_files: true
 
+# Paint the theme's own background (false), or leave the terminal's showing
+# through (true) so its transparency and blur are kept. Press `T` then `b`
+# in the app to toggle; the choice is saved here. `default` has no background of its own.
+transparent_background: true
+
+# When a torrent arrives from a browser link or another window, open the tag
+# list for it so it can be tagged straight away (Esc skips). The add dialog
+# (`a`) always has its own tag list.
+ask_tags: true
+
 # Desktop notifications (via notify-send) from the background daemon when no
 # torrentui window is open: torrents added from a browser, failures, and
 # torrents waiting for a file selection.
@@ -54,7 +66,9 @@ notify: true
 # arguments are replaced (tags are comma-separated). The same values are in
 # $TORRENTUI_PATH, $TORRENTUI_NAME, $TORRENTUI_HASH and $TORRENTUI_TAGS. With
 # `tags`, only torrents that have at least one of those tags run it. Output is
-# appended to ~/.local/share/torrentui/actions.log. Read at startup.
+# appended to ~/.local/share/torrentui/actions.log. Press `A` in the app to
+# add, edit and delete these (saved here, in effect at once); editing this
+# file by hand needs `torrentui daemon restart`.
 #
 # on_complete:
 #   - name: sort movies
@@ -85,6 +99,8 @@ pub struct Config {
     pub dht: bool,
     pub ask_files: bool,
     pub notify: bool,
+    pub transparent_background: bool,
+    pub ask_tags: bool,
     pub on_complete: Vec<HookSpec>,
     pub themes: BTreeMap<String, ThemeSpec>,
 }
@@ -100,6 +116,8 @@ impl Default for Config {
             dht: true,
             ask_files: true,
             notify: true,
+            transparent_background: true,
+            ask_tags: true,
             on_complete: Vec::new(),
             themes: BTreeMap::new(),
         }
@@ -235,17 +253,137 @@ pub(crate) fn write_atomic(path: &Path, text: &str) -> Result<()> {
     Ok(())
 }
 
-/// Set a top-level `key: value` in the file, keeping every other line (and
-/// comments) untouched. `value` is raw YAML. The edit is checked to still
-/// parse before anything is written.
-pub fn set_value(path: &Path, key: &str, value: &str) -> Result<()> {
-    let existing = match fs::read_to_string(path) {
+/// Read the config for an in-place edit. A file that already fails to parse is
+/// reported as such, so a hand-made mistake isn't blamed on the value being
+/// saved.
+fn read_for_edit(path: &Path) -> Result<String> {
+    let text = match fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => DEFAULT_CONFIG.to_string(),
         Err(e) => return Err(e).wrap_err_with(|| format!("cannot read {}", path.display())),
     };
+    parse(&text).wrap_err_with(|| {
+        format!(
+            "{} has an error, so it was not changed (fix it first, e.g. with E)",
+            path.display()
+        )
+    })?;
+    Ok(text)
+}
+
+/// Set a top-level `key: value` in the file, keeping every other line (and
+/// comments) untouched. `value` is raw YAML. The edit is checked to still
+/// parse before anything is written.
+pub fn set_value(path: &Path, key: &str, value: &str) -> Result<()> {
+    let existing = read_for_edit(path)?;
     let updated = replace_key(&existing, key, value);
     parse(&updated).wrap_err_with(|| format!("refusing to write invalid {key}: {value}"))?;
+    write_atomic(path, &updated)
+}
+
+/// A string as an item of a YAML flow list (`[a, b]`). Plain when that reads
+/// back unchanged, else quoted: `{ } [ ] ,` end or open things in a flow list
+/// even where a block-style scalar may contain them.
+fn flow_scalar(s: &str) -> String {
+    let reads_back = |text: &str| {
+        serde_yaml_ng::from_str::<Vec<String>>(&format!("[{text}]"))
+            .is_ok_and(|v| v.len() == 1 && v[0] == s)
+    };
+    let plain = !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_./~=:+@%-".contains(c))
+        && reads_back(s);
+    if plain {
+        return s.to_string();
+    }
+    let single = format!("'{}'", s.replace('\'', "''"));
+    if reads_back(&single) {
+        return single;
+    }
+    // A JSON string is a valid YAML double-quoted scalar.
+    serde_json::to_string(s).unwrap_or_else(|_| format!("{s:?}"))
+}
+
+/// The `on_complete:` block for these actions, in the layout the config
+/// template documents (flow lists for `run` and `tags`).
+pub fn render_on_complete(hooks: &[crate::actions::HookSpec]) -> String {
+    let list = |items: &[String]| {
+        items
+            .iter()
+            .map(|s| flow_scalar(s))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mut out = String::from("on_complete:\n");
+    for h in hooks {
+        let mut first = true;
+        let mut line = |text: String| {
+            out.push_str(if first { "  - " } else { "    " });
+            out.push_str(&text);
+            out.push('\n');
+            first = false;
+        };
+        if let Some(name) = &h.name {
+            line(format!("name: {}", yaml_scalar(name)));
+        }
+        line(format!("run: [{}]", list(&h.run)));
+        if !h.tags.is_empty() {
+            line(format!("tags: [{}]", list(&h.tags)));
+        }
+        line(format!("timeout_secs: {}", h.timeout_secs));
+    }
+    out
+}
+
+/// Replace the top-level `on_complete:` block, keeping every other line. The
+/// block is the key line plus the indented (or `- `) lines after it; comments
+/// and blank lines trailing it stay where they are. With no actions the block
+/// is removed; with none present the new one goes at the end.
+fn replace_on_complete(text: &str, block: Option<&str>) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines
+        .iter()
+        .position(|l| l.starts_with("on_complete:") || l.starts_with("on_complete :"));
+    let mut out: Vec<&str> = Vec::new();
+    match start {
+        Some(s) => {
+            let mut end = s + 1;
+            for (i, l) in lines.iter().enumerate().skip(s + 1) {
+                if l.starts_with(char::is_whitespace) || *l == "-" || l.starts_with("- ") {
+                    end = i + 1;
+                } else if !l.trim().is_empty() && !l.starts_with('#') {
+                    break;
+                }
+            }
+            out.extend(&lines[..s]);
+            if let Some(b) = block {
+                out.extend(b.lines());
+            }
+            out.extend(&lines[end..]);
+        }
+        None => {
+            out.extend(&lines);
+            if let Some(b) = block {
+                if out.last().is_some_and(|l| !l.trim().is_empty()) {
+                    out.push("");
+                }
+                out.extend(b.lines());
+            }
+        }
+    }
+    out.join("\n") + "\n"
+}
+
+/// Write these actions as the config's `on_complete`, leaving everything else
+/// (comments included) as it was. Refuses anything that would not load again.
+pub fn set_on_complete(path: &Path, hooks: &[crate::actions::HookSpec]) -> Result<()> {
+    let existing = read_for_edit(path)?;
+    let block = (!hooks.is_empty()).then(|| render_on_complete(hooks));
+    let updated = replace_on_complete(&existing, block.as_deref());
+    let cfg = parse(&updated).wrap_err("refusing to write an invalid on_complete")?;
+    if cfg.on_complete != hooks {
+        bail!("refusing to write on_complete: it would not read back the same");
+    }
     write_atomic(path, &updated)
 }
 
@@ -456,6 +594,8 @@ mod tests {
         assert_eq!(parsed.peer_limit, d.peer_limit);
         assert_eq!(parsed.dht, d.dht);
         assert_eq!(parsed.ask_files, d.ask_files);
+        assert_eq!(parsed.transparent_background, d.transparent_background);
+        assert_eq!(parsed.ask_tags, d.ask_tags);
         assert_eq!(parsed.download_dir, d.download_dir);
         assert!(parsed.themes.is_empty());
     }
@@ -688,5 +828,146 @@ mod tests {
     fn default_download_dir_is_always_absolute() {
         let d = Config::default().download_dir().unwrap();
         assert!(d.is_absolute(), "{d:?}");
+    }
+
+    fn spec(
+        name: Option<&str>,
+        run: &[&str],
+        tags: &[&str],
+        timeout: u64,
+    ) -> crate::actions::HookSpec {
+        crate::actions::HookSpec {
+            name: name.map(String::from),
+            run: run.iter().map(|s| s.to_string()).collect(),
+            tags: tags.iter().map(|s| s.to_string()).collect(),
+            timeout_secs: timeout,
+        }
+    }
+
+    #[test]
+    fn on_complete_block_round_trips_through_the_parser() {
+        let hooks = vec![
+            spec(
+                Some("sort: movies"),
+                &["~/bin/sort.sh", "{path}", "two words", "it's"],
+                &["movies", "4k"],
+                600,
+            ),
+            spec(None, &["notify-send", "done"], &[], 0),
+        ];
+        let text = render_on_complete(&hooks);
+        assert_eq!(parse(&text).unwrap().on_complete, hooks, "{text}");
+        assert!(crate::actions::resolve(&parse(&text).unwrap().on_complete).is_ok());
+    }
+
+    #[test]
+    fn replacing_on_complete_keeps_everything_else() {
+        let old = "theme: dracula\n# about actions\non_complete:\n  - run: [a]\n    tags: [x]\n\n  # inner note\n  - run: [b]\n# trailing comment\nmax_upload_speed: 0\n";
+        let hooks = vec![spec(None, &["c", "{path}"], &["y"], 5)];
+        let out = replace_on_complete(old, Some(&render_on_complete(&hooks)));
+        assert!(
+            out.starts_with(
+                "theme: dracula\n# about actions\non_complete:\n  - run: [c, '{path}']"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains("# trailing comment\nmax_upload_speed: 0\n"),
+            "{out}"
+        );
+        assert!(!out.contains("run: [a]") && !out.contains("run: [b]"));
+        assert_eq!(parse(&out).unwrap().on_complete, hooks);
+
+        // Removing the last action drops the block; the commented template stays.
+        let none = replace_on_complete(old, None);
+        assert!(!none.contains("on_complete:") && none.contains("# trailing comment"));
+        assert!(parse(&none).unwrap().on_complete.is_empty());
+
+        // Sequence written at the key's own indent is still one block.
+        let flush = "on_complete:\n- run: [a]\n- run: [b]\ntheme: x\n";
+        assert_eq!(replace_on_complete(flush, None), "theme: x\n");
+
+        // No block yet: appended after a blank line.
+        let added = replace_on_complete("theme: x\n", Some("on_complete:\n  - run: [a]\n"));
+        assert_eq!(added, "theme: x\n\non_complete:\n  - run: [a]\n");
+        // A commented-out template is not a block.
+        let templ = "# on_complete:\n#   - run: [a]\n";
+        assert!(replace_on_complete(templ, None).contains("# on_complete:"));
+    }
+
+    #[test]
+    fn set_on_complete_writes_and_clears() {
+        let dir = std::env::temp_dir().join(format!("torrentui-oc-set-{}", std::process::id()));
+        let path = dir.join("config.yml");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, "theme: dracula\n").unwrap();
+        let hooks = vec![spec(Some("a"), &["x"], &["t"], 9)];
+        set_on_complete(&path, &hooks).unwrap();
+        let cfg = load(&path).unwrap();
+        assert_eq!(cfg.on_complete, hooks);
+        assert_eq!(cfg.theme, "dracula");
+        set_on_complete(&path, &[]).unwrap();
+        assert!(load(&path).unwrap().on_complete.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn flow_lists_survive_braces_commas_quotes_and_yaml_keywords() {
+        let run = [
+            "formatui",
+            "run",
+            "{path}",
+            "--rules={tags}",
+            "a,b",
+            "[x]",
+            "it's",
+            "say \"hi\"",
+            "two words",
+            "true",
+            "123",
+            "null",
+            "-",
+            "",
+            "# not a comment",
+            "k: v",
+        ];
+        let hooks = vec![spec(Some("n"), &run, &["a", "true", "4k"], 1)];
+        let text = render_on_complete(&hooks);
+        assert_eq!(parse(&text).unwrap().on_complete, hooks, "{text}");
+        // The command from the bug report stays readable.
+        let one = render_on_complete(&[spec(
+            None,
+            &["formatui", "run", "{path}", "--rules={tags}"],
+            &[],
+            600,
+        )]);
+        assert!(
+            one.contains("run: [formatui, run, '{path}', '--rules={tags}']"),
+            "{one}"
+        );
+    }
+
+    #[test]
+    fn editing_a_broken_config_blames_the_file_not_the_value() {
+        let dir = std::env::temp_dir().join(format!("torrentui-broken-{}", std::process::id()));
+        let path = dir.join("config.yml");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, "thme: dracula\n").unwrap();
+        for err in [
+            set_value(&path, "theme", "nord").unwrap_err(),
+            set_on_complete(&path, &[spec(None, &["x"], &[], 1)]).unwrap_err(),
+        ] {
+            let text = format!("{err:#}");
+            assert!(
+                text.contains("has an error") && text.contains("unknown field `thme`"),
+                "{text}"
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "thme: dracula\n",
+            "untouched"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 }

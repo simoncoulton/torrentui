@@ -84,6 +84,13 @@ pub struct EngineOptions {
     pub dht: bool,
 }
 
+/// A torrent that was just added.
+#[derive(Debug, Clone)]
+pub struct Added {
+    pub name: String,
+    pub info_hash: String,
+}
+
 /// One selectable file inside a torrent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileEntry {
@@ -197,14 +204,17 @@ impl Engine {
         &self,
         add: AddTorrent<'_>,
         only_files: Option<Vec<usize>>,
-    ) -> Result<String> {
+    ) -> Result<Added> {
         let resp = self
             .session
             .add_torrent(add, Some(Self::add_options(only_files)))
             .await
             .map_err(|e| eyre!("{e:#}"))?;
         match resp {
-            AddTorrentResponse::Added(_, h) => Ok(h.name().unwrap_or_else(|| "torrent".into())),
+            AddTorrentResponse::Added(_, h) => Ok(Added {
+                name: h.name().unwrap_or_else(|| "torrent".into()),
+                info_hash: h.info_hash().as_string(),
+            }),
             AddTorrentResponse::AlreadyManaged(_, h) => Err(eyre!(
                 "already added: {}",
                 h.name().unwrap_or_else(|| "torrent".into())
@@ -219,7 +229,7 @@ impl Engine {
     ///
     /// For magnet links this resolves metadata from the swarm first, so it can
     /// take a while; call it from a spawned task.
-    pub async fn add(&self, input: &str) -> Result<String> {
+    pub async fn add(&self, input: &str) -> Result<Added> {
         self.add_source(Self::source(input).await?, None).await
     }
 
@@ -274,7 +284,7 @@ impl Engine {
         &self,
         torrent_bytes: Vec<u8>,
         only_files: Vec<usize>,
-    ) -> Result<String> {
+    ) -> Result<Added> {
         self.add_source(AddTorrent::from_bytes(torrent_bytes), Some(only_files))
             .await
     }

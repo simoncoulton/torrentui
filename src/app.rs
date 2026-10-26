@@ -11,8 +11,10 @@ use std::num::NonZeroU32;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::{
+    actions::HookSpec,
     config::Rate,
     engine::{FileEntry, FileList, Status, TorrentView},
+    forms::{HookEditor, HookManager, TagChecklist},
     proto::{PickerInfo, State},
     tags::{self, Tags},
     theme::{self, Theme},
@@ -21,6 +23,11 @@ use crate::{
 const HISTORY_LEN: usize = 120;
 /// How long a status message stays visible.
 const STATUS_TTL: Duration = Duration::from_secs(6);
+/// How long an add made in this window can wait for its torrent to appear
+/// (a magnet resolves its metadata from the swarm first).
+/// ...but once the daemon has nothing left to add, only this long.
+const OWN_ADD_IDLE: Duration = Duration::from_secs(5);
+const OWN_ADD_TTL: Duration = Duration::from_secs(600);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
@@ -47,6 +54,10 @@ pub enum Mode {
     Tags,
     /// Tag filter chooser; state in [`App::filter_picker`].
     Filter,
+    /// The list of `on_complete` actions; state in [`App::hook_manager`].
+    Hooks,
+    /// Adding or editing one action; state in [`App::hook_editor`].
+    HookEdit,
     Help,
 }
 
@@ -137,7 +148,11 @@ impl FilePicker {
 /// Side effects requested by input handling; executed by the event loop.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Action {
-    Add(String),
+    /// Add a torrent, giving it these tags once it exists.
+    Add {
+        input: String,
+        tags: Vec<String>,
+    },
     TogglePause(usize),
     /// Load the file list of an existing torrent to show the picker.
     OpenFiles(usize),
@@ -150,7 +165,12 @@ pub enum Action {
         delete_files: bool,
     },
     /// Persist the chosen theme name.
-    SaveTheme(String),
+    /// `transparent` is set only when the picker changed the background
+    /// setting, so an untouched one is not written to the config.
+    SaveTheme {
+        name: String,
+        transparent: Option<bool>,
+    },
     /// Apply and persist new global speed limits.
     SetLimits {
         download: Rate,
@@ -162,6 +182,14 @@ pub enum Action {
     RunActions(usize),
     /// Quit and also stop the background daemon.
     StopDaemon,
+    /// The `on_complete` actions changed (already applied to [`App::hooks`]):
+    /// save them and make the daemon use them.
+    SetHooks(Vec<HookSpec>),
+    /// Delete a tag everywhere (already applied to [`App::tags`] and
+    /// [`App::hooks`]).
+    DeleteTag(String),
+    /// Open the config file in `$EDITOR`.
+    EditConfig,
     /// A torrent's tags changed (already applied to [`App::tags`]); persist them.
     SetTags {
         info_hash: String,
@@ -238,6 +266,8 @@ pub struct ThemePicker {
     pub cursor: usize,
     /// Index of the theme in effect when the picker opened, restored on cancel.
     original: usize,
+    /// Whether the background was transparent when it opened, likewise.
+    original_transparent: bool,
 }
 
 pub struct LimitsDialog {
@@ -261,10 +291,9 @@ impl LimitsDialog {
 pub struct TagEditor {
     info_hash: String,
     pub name: String,
-    pub input: Input,
-    /// Tags already used by other torrents, with how many torrents use each.
-    pub in_use: Vec<(String, usize)>,
-    pub error: Option<String>,
+    pub list: TagChecklist,
+    /// Opened by itself for a torrent that was just added (Esc skips it).
+    pub prompt: bool,
 }
 
 pub struct FilterPicker {
@@ -299,6 +328,8 @@ pub struct App {
     pub down_history: VecDeque<u64>,
     pub download_dir: String,
     pub theme: Theme,
+    /// Whether the theme's background is dropped so the terminal's shows.
+    pub transparent: bool,
     pub themes: Vec<Theme>,
     theme_index: usize,
     pub theme_picker: Option<ThemePicker>,
@@ -317,6 +348,24 @@ pub struct App {
     view: Vec<usize>,
     pub tag_editor: Option<TagEditor>,
     pub filter_picker: Option<FilterPicker>,
+    /// Tags to give the torrent being added, chosen in the add dialog.
+    pub add_tags: Option<TagChecklist>,
+    /// Whether the add dialog's tag list (not the link field) has the keyboard.
+    pub add_focus_tags: bool,
+    /// Offer to tag torrents that arrive from elsewhere (`ask_tags`).
+    pub ask_tags: bool,
+    /// Torrent ids already seen, so only new arrivals are offered tags.
+    seen_ids: Option<HashSet<usize>>,
+    /// Adds started here with a tag choice, so their torrents are not
+    /// prompted for again when they appear.
+    own_adds: VecDeque<Instant>,
+    /// New torrents waiting for their tag prompt.
+    tag_prompts: VecDeque<usize>,
+    /// The configured `on_complete` actions (the daemon's copy, refreshed
+    /// with every state).
+    pub hooks: Vec<HookSpec>,
+    pub hook_manager: Option<HookManager>,
+    pub hook_editor: Option<HookEditor>,
     /// Whether the per-file progress panel is open (`F`).
     pub file_panel: bool,
     pub panel_files: Option<PanelFiles>,
@@ -341,6 +390,7 @@ impl App {
             down_history: VecDeque::with_capacity(HISTORY_LEN),
             download_dir,
             theme: theme::default_theme(),
+            transparent: true,
             themes: theme::builtin_themes(),
             theme_index: 0,
             theme_picker: None,
@@ -353,6 +403,15 @@ impl App {
             view: Vec::new(),
             tag_editor: None,
             filter_picker: None,
+            add_tags: None,
+            add_focus_tags: false,
+            ask_tags: false,
+            seen_ids: None,
+            own_adds: VecDeque::new(),
+            tag_prompts: VecDeque::new(),
+            hooks: Vec::new(),
+            hook_manager: None,
+            hook_editor: None,
             file_panel: false,
             panel_files: None,
             panel_scroll: 0,
@@ -380,13 +439,26 @@ impl App {
         });
     }
 
+    /// Switch between the theme's background and the terminal's.
+    pub fn set_transparent(&mut self, on: bool) {
+        self.transparent = on;
+        // The theme being previewed, if the picker is open.
+        let shown = self
+            .theme_picker
+            .as_ref()
+            .map_or(self.theme_index, |p| p.cursor);
+        self.theme = self.themes[shown].clone().transparent(on);
+    }
+
     /// Install the available themes and make `current` (by name) active.
     pub fn set_themes(&mut self, themes: Vec<Theme>, current: &str) {
         self.theme_index = themes
             .iter()
             .position(|t| theme::normalize(&t.name) == theme::normalize(current))
             .unwrap_or(0);
-        self.theme = themes[self.theme_index].clone();
+        self.theme = themes[self.theme_index]
+            .clone()
+            .transparent(self.transparent);
         self.themes = themes;
     }
 
@@ -454,6 +526,11 @@ impl App {
     pub fn apply_state(&mut self, state: State) {
         if self.settings_in_flight == 0 {
             self.tags = state.tags;
+            self.hooks = state.hooks;
+            self.has_actions = !self.hooks.is_empty();
+            if let Some(m) = self.hook_manager.as_mut() {
+                m.cursor = m.cursor.min(self.hooks.len().saturating_sub(1));
+            }
             self.limits = (
                 Rate(state.download_limit.and_then(NonZeroU32::new)),
                 Rate(state.upload_limit.and_then(NonZeroU32::new)),
@@ -464,6 +541,11 @@ impl App {
         // After the tags: the filter depends on them.
         self.update_torrents(state.torrents);
         self.sync_pickers(state.pickers);
+        // An add that failed never produces a torrent; once the daemon is
+        // idle, forget our own adds that have had time to show up.
+        if self.pending_adds == 0 && self.known_pickers.is_empty() {
+            self.own_adds.retain(|t| t.elapsed() < OWN_ADD_IDLE);
+        }
     }
 
     /// Show file selections other windows or the browser queued, and drop
@@ -517,6 +599,16 @@ impl App {
             .collect()
     }
 
+    /// Every tag worth offering: those on torrents (with how many) and those
+    /// an action is limited to even if no torrent has them yet.
+    fn known_tags(&self) -> Vec<(String, usize)> {
+        let mut known: BTreeMap<String, usize> = self.tag_counts().into_iter().collect();
+        for tag in self.hooks.iter().flat_map(|h| &h.tags) {
+            known.entry(tag.clone()).or_default();
+        }
+        known.into_iter().collect()
+    }
+
     /// Recompute the filtered list, keeping the cursor on the same torrent
     /// where possible. A filter that no longer matches anything is dropped.
     fn refresh_view(&mut self) {
@@ -548,6 +640,7 @@ impl App {
     pub fn update_torrents(&mut self, torrents: Vec<TorrentView>) {
         self.torrents = torrents;
         self.refresh_view();
+        self.note_new_torrents();
 
         if self.down_history.len() == HISTORY_LEN {
             self.down_history.pop_front();
@@ -566,7 +659,13 @@ impl App {
 
     pub fn handle_paste(&mut self, text: &str) {
         match self.mode {
-            Mode::Add => self.input.insert_str(text.trim()),
+            Mode::Add => match self.add_tags.as_mut().filter(|_| self.add_focus_tags) {
+                Some(list) => {
+                    list.cursor = 0;
+                    list.input.insert_str(text.trim());
+                }
+                None => self.input.insert_str(text.trim()),
+            },
             Mode::Limits => {
                 if let Some(d) = self.limits_dialog.as_mut() {
                     d.active().insert_str(text.trim());
@@ -574,7 +673,20 @@ impl App {
             }
             Mode::Tags => {
                 if let Some(e) = self.tag_editor.as_mut() {
-                    e.input.insert_str(text.trim());
+                    e.list.cursor = 0;
+                    e.list.input.insert_str(text.trim());
+                    e.list.error = None;
+                }
+            }
+            Mode::HookEdit => {
+                if let Some(e) = self.hook_editor.as_mut() {
+                    match e.field() {
+                        Some(field) => field.insert_str(text.trim()),
+                        None => {
+                            e.tags.cursor = 0;
+                            e.tags.input.insert_str(text.trim());
+                        }
+                    }
                     e.error = None;
                 }
             }
@@ -594,6 +706,8 @@ impl App {
             } => self.key_confirm(key, id, delete_files),
             Mode::Files => self.key_files(key),
             Mode::Theme => self.key_theme(key),
+            Mode::Hooks => self.key_hooks(key),
+            Mode::HookEdit => self.key_hook_edit(key),
             Mode::Limits => self.key_limits(key),
             Mode::ConfirmStop => self.key_confirm_stop(key),
             Mode::Tags => self.key_tags(key),
@@ -622,6 +736,8 @@ impl App {
             KeyCode::Char('Q') => self.mode = Mode::ConfirmStop,
             KeyCode::Char('a') => {
                 self.input.clear();
+                self.add_tags = Some(TagChecklist::new(self.known_tags(), &[]));
+                self.add_focus_tags = false;
                 self.mode = Mode::Add;
             }
             KeyCode::Char('?') | KeyCode::F(1) => self.mode = Mode::Help,
@@ -629,6 +745,7 @@ impl App {
                 self.theme_picker = Some(ThemePicker {
                     cursor: self.theme_index,
                     original: self.theme_index,
+                    original_transparent: self.transparent,
                 });
                 self.mode = Mode::Theme;
             }
@@ -651,6 +768,11 @@ impl App {
             KeyCode::Char('x') => return self.run_actions_key(),
             KeyCode::Char('t') => self.open_tag_editor(),
             KeyCode::Char('/') => self.open_filter_picker(),
+            KeyCode::Char('E') => return Some(Action::EditConfig),
+            KeyCode::Char('A') => {
+                self.hook_manager = Some(HookManager::default());
+                self.mode = Mode::Hooks;
+            }
             KeyCode::Char('F') => {
                 self.file_panel = !self.file_panel;
                 self.panel_files = None;
@@ -682,14 +804,36 @@ impl App {
     }
 
     fn key_add(&mut self, key: KeyEvent) -> Option<Action> {
+        let Some(list) = self.add_tags.as_mut() else {
+            self.mode = Mode::Normal;
+            return None;
+        };
+        let focus_tags = self.add_focus_tags;
         match key.code {
-            KeyCode::Esc => self.mode = Mode::Normal,
-            KeyCode::Enter => {
-                let text = self.input.text();
+            KeyCode::Esc if list.confirm_delete.is_none() => {
+                self.add_tags = None;
                 self.mode = Mode::Normal;
-                self.input.clear();
-                if !text.trim().is_empty() {
-                    return Some(Action::Add(text));
+            }
+            KeyCode::Tab | KeyCode::BackTab => self.add_focus_tags = !focus_tags,
+            KeyCode::Down if !focus_tags => self.add_focus_tags = true,
+            KeyCode::Up if focus_tags && list.cursor == 0 && list.confirm_delete.is_none() => {
+                self.add_focus_tags = false;
+            }
+            KeyCode::Enter if !focus_tags => return self.submit_add(),
+            _ if focus_tags => {
+                let save = list.handle_key(&key);
+                if let Some(tag) = list.take_deleted() {
+                    let result = self.delete_tag_everywhere(&tag);
+                    let list = self.add_tags.as_mut()?;
+                    match result {
+                        Ok(action) => {
+                            list.remove(&tag);
+                            return Some(action);
+                        }
+                        Err(e) => list.error = Some(e),
+                    }
+                } else if save {
+                    return self.submit_add();
                 }
             }
             _ => {
@@ -697,6 +841,26 @@ impl App {
             }
         }
         None
+    }
+
+    /// Send what the add dialog holds. An empty link just closes it.
+    fn submit_add(&mut self) -> Option<Action> {
+        let text = self.input.text();
+        let list = self.add_tags.as_mut()?;
+        let tags = list.checked();
+        if let Err(e) = tags::parse_tags(&tags.join(" ")) {
+            list.error = Some(e);
+            return None;
+        }
+        self.add_tags = None;
+        self.mode = Mode::Normal;
+        self.input.clear();
+        if text.trim().is_empty() {
+            return None;
+        }
+        // The tag choice was made here; don't ask again when it arrives.
+        self.own_adds.push_back(Instant::now());
+        Some(Action::Add { input: text, tags })
     }
 
     fn key_theme(&mut self, key: KeyEvent) -> Option<Action> {
@@ -710,25 +874,36 @@ impl App {
             KeyCode::Up | KeyCode::Char('k') => picker.cursor = picker.cursor.saturating_sub(1),
             KeyCode::Home | KeyCode::Char('g') => picker.cursor = 0,
             KeyCode::End | KeyCode::Char('G') => picker.cursor = last,
+            KeyCode::Char('b') => {
+                let on = !self.transparent;
+                self.set_transparent(on);
+                return None;
+            }
             KeyCode::Esc | KeyCode::Char('q') => {
-                let original = picker.original;
+                let (original, was) = (picker.original, picker.original_transparent);
                 self.theme_picker = None;
-                self.theme = self.themes[original].clone();
+                self.transparent = was;
+                self.theme = self.themes[original].clone().transparent(was);
                 self.mode = Mode::Normal;
                 return None;
             }
             KeyCode::Enter => {
-                let cursor = picker.cursor;
+                let (cursor, was) = (picker.cursor, picker.original_transparent);
                 self.theme_picker = None;
                 self.theme_index = cursor;
-                self.theme = self.themes[cursor].clone();
+                self.theme = self.themes[cursor].clone().transparent(self.transparent);
                 self.mode = Mode::Normal;
-                return Some(Action::SaveTheme(self.theme.name.clone()));
+                return Some(Action::SaveTheme {
+                    name: self.theme.name.clone(),
+                    transparent: (self.transparent != was).then_some(self.transparent),
+                });
             }
             _ => return None,
         }
         // Live preview of the highlighted theme.
-        self.theme = self.themes[picker.cursor].clone();
+        self.theme = self.themes[picker.cursor]
+            .clone()
+            .transparent(self.transparent);
         None
     }
 
@@ -799,18 +974,69 @@ impl App {
     fn open_tag_editor(&mut self) {
         let Some(t) = self.current() else { return };
         let (info_hash, name) = (t.info_hash.clone(), t.name.clone());
-        let mut input = Input::default();
-        input.set(&self.tags_of(t).join(" "));
-        // Offered as suggestions so tags stay consistent across torrents.
-        let in_use = self.tag_counts();
+        self.open_tags_for(info_hash, name, false);
+    }
+
+    fn open_tags_for(&mut self, info_hash: String, name: String, prompt: bool) {
+        let current = self.tags.get(&info_hash).cloned().unwrap_or_default();
+        // Every tag in use is offered so tags stay consistent across torrents.
+        let list = TagChecklist::new(self.known_tags(), &current);
         self.tag_editor = Some(TagEditor {
             info_hash,
             name,
-            input,
-            in_use,
-            error: None,
+            list,
+            prompt,
         });
         self.mode = Mode::Tags;
+    }
+
+    /// Offer tags for the next torrent that arrived from elsewhere (a browser
+    /// link, another window), once the user is out of other dialogs.
+    pub fn open_next_tag_prompt(&mut self) {
+        if self.mode != Mode::Normal || self.tag_editor.is_some() {
+            return;
+        }
+        while let Some(id) = self.tag_prompts.pop_front() {
+            let Some(t) = self.torrents.iter().find(|t| t.id == id) else {
+                continue;
+            };
+            // Tagged in the meantime (another window, the add dialog).
+            if self.tags.get(&t.info_hash).is_some_and(|v| !v.is_empty()) {
+                continue;
+            }
+            let (info_hash, name) = (t.info_hash.clone(), t.name.clone());
+            self.open_tags_for(info_hash, name, true);
+            return;
+        }
+    }
+
+    /// Queue a tag prompt for each torrent not seen before.
+    fn note_new_torrents(&mut self) {
+        let ids: HashSet<usize> = self.torrents.iter().map(|t| t.id).collect();
+        let Some(seen) = self.seen_ids.as_mut() else {
+            // The first state is what was already there.
+            self.seen_ids = Some(ids);
+            return;
+        };
+        let fresh: Vec<usize> = self
+            .torrents
+            .iter()
+            .filter(|t| seen.insert(t.id))
+            .map(|t| t.id)
+            .collect();
+        for id in fresh {
+            while self
+                .own_adds
+                .front()
+                .is_some_and(|t| t.elapsed() > OWN_ADD_TTL)
+            {
+                self.own_adds.pop_front();
+            }
+            if self.own_adds.pop_front().is_some() || !self.ask_tags {
+                continue;
+            }
+            self.tag_prompts.push_back(id);
+        }
     }
 
     fn key_tags(&mut self, key: KeyEvent) -> Option<Action> {
@@ -818,36 +1044,180 @@ impl App {
             self.mode = Mode::Normal;
             return None;
         };
-        match key.code {
-            KeyCode::Esc => {
+        // Esc backs out of a pending delete before it closes the editor.
+        if key.code == KeyCode::Esc && editor.list.confirm_delete.is_none() {
+            self.tag_editor = None;
+            self.mode = Mode::Normal;
+            return None;
+        }
+        let save = editor.list.handle_key(&key);
+        if let Some(tag) = editor.list.take_deleted() {
+            let result = self.delete_tag_everywhere(&tag);
+            let list = &mut self.tag_editor.as_mut()?.list;
+            return match result {
+                Ok(action) => {
+                    list.remove(&tag);
+                    Some(action)
+                }
+                Err(e) => {
+                    list.error = Some(e);
+                    None
+                }
+            };
+        }
+        if !save {
+            return None;
+        }
+        match tags::parse_tags(&editor.list.checked().join(" ")) {
+            Ok(list) => {
+                let info_hash = editor.info_hash.clone();
                 self.tag_editor = None;
                 self.mode = Mode::Normal;
+                if list.is_empty() {
+                    self.tags.remove(&info_hash);
+                } else {
+                    self.tags.insert(info_hash.clone(), list.clone());
+                }
+                self.refresh_view();
+                Some(Action::SetTags {
+                    info_hash,
+                    tags: list,
+                })
             }
-            KeyCode::Enter => match tags::parse_tags(&editor.input.text()) {
-                Ok(list) => {
-                    let info_hash = editor.info_hash.clone();
-                    self.tag_editor = None;
-                    self.mode = Mode::Normal;
-                    if list.is_empty() {
-                        self.tags.remove(&info_hash);
-                    } else {
-                        self.tags.insert(info_hash.clone(), list.clone());
-                    }
-                    self.refresh_view();
-                    return Some(Action::SetTags {
-                        info_hash,
-                        tags: list,
-                    });
-                }
-                Err(e) => editor.error = Some(e),
-            },
-            _ => {
-                if editor.input.handle_key(&key) {
-                    editor.error = None;
-                }
+            Err(e) => {
+                editor.list.error = Some(e);
+                None
             }
         }
+    }
+
+    /// Remove a tag from every torrent and action here, ahead of the daemon
+    /// doing the same. An action limited to only this tag would start running
+    /// for every torrent, so that is refused.
+    fn delete_tag_everywhere(&mut self, tag: &str) -> Result<Action, String> {
+        if let Some(h) = self.hooks.iter().find(|h| h.tags == [tag]) {
+            let label = h
+                .name
+                .clone()
+                .unwrap_or_else(|| crate::actions::join_command(&h.run));
+            return Err(format!(
+                "Action \"{label}\" only runs for #{tag}: edit or delete it first"
+            ));
+        }
+        for list in self.tags.values_mut() {
+            list.retain(|t| t != tag);
+        }
+        self.tags.retain(|_, list| !list.is_empty());
+        for h in &mut self.hooks {
+            h.tags.retain(|t| t != tag);
+        }
+        self.refresh_view();
+        self.set_status(format!("Deleted tag #{tag}"), false);
+        Ok(Action::DeleteTag(tag.to_string()))
+    }
+
+    fn key_hooks(&mut self, key: KeyEvent) -> Option<Action> {
+        let Some(manager) = self.hook_manager.as_mut() else {
+            self.mode = Mode::Normal;
+            return None;
+        };
+        let last = self.hooks.len().saturating_sub(1);
+        if manager.confirm_delete {
+            match key.code {
+                KeyCode::Char('y') => {
+                    manager.confirm_delete = false;
+                    if manager.cursor < self.hooks.len() {
+                        self.hooks.remove(manager.cursor);
+                        manager.cursor = manager.cursor.min(self.hooks.len().saturating_sub(1));
+                        self.has_actions = !self.hooks.is_empty();
+                        return Some(Action::SetHooks(self.hooks.clone()));
+                    }
+                }
+                KeyCode::Char('n') | KeyCode::Esc | KeyCode::Char('q') => {
+                    manager.confirm_delete = false;
+                }
+                _ => {}
+            }
+            return None;
+        }
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.hook_manager = None;
+                self.mode = Mode::Normal;
+            }
+            KeyCode::Down | KeyCode::Char('j') => manager.cursor = (manager.cursor + 1).min(last),
+            KeyCode::Up | KeyCode::Char('k') => manager.cursor = manager.cursor.saturating_sub(1),
+            KeyCode::Char('a') => {
+                self.hook_editor = Some(HookEditor::new(self.known_tags(), None));
+                self.mode = Mode::HookEdit;
+            }
+            KeyCode::Enter | KeyCode::Char('e') => {
+                let index = manager.cursor;
+                if let Some(spec) = self.hooks.get(index) {
+                    self.hook_editor =
+                        Some(HookEditor::new(self.known_tags(), Some((index, spec))));
+                    self.mode = Mode::HookEdit;
+                }
+            }
+            KeyCode::Char('d') | KeyCode::Delete if !self.hooks.is_empty() => {
+                manager.confirm_delete = true;
+            }
+            _ => {}
+        }
         None
+    }
+
+    fn key_hook_edit(&mut self, key: KeyEvent) -> Option<Action> {
+        let Some(editor) = self.hook_editor.as_mut() else {
+            self.mode = Mode::Hooks;
+            return None;
+        };
+        if key.code == KeyCode::Esc && editor.tags.confirm_delete.is_none() {
+            self.hook_editor = None;
+            self.mode = Mode::Hooks;
+            return None;
+        }
+        let outcome = editor.handle_key(&key);
+        if let Some(tag) = editor.tags.take_deleted() {
+            let result = self.delete_tag_everywhere(&tag);
+            let editor = self.hook_editor.as_mut()?;
+            return match result {
+                Ok(action) => {
+                    editor.tags.remove(&tag);
+                    Some(action)
+                }
+                Err(e) => {
+                    editor.error = Some(e);
+                    None
+                }
+            };
+        }
+        match outcome? {
+            Err(e) => {
+                editor.error = Some(e);
+                None
+            }
+            Ok(spec) => {
+                let at = match editor.index.filter(|&i| i < self.hooks.len()) {
+                    Some(i) => {
+                        self.hooks[i] = spec;
+                        i
+                    }
+                    None => {
+                        self.hooks.push(spec);
+                        self.hooks.len() - 1
+                    }
+                };
+                self.hook_editor = None;
+                self.has_actions = true;
+                self.hook_manager = Some(HookManager {
+                    cursor: at,
+                    confirm_delete: false,
+                });
+                self.mode = Mode::Hooks;
+                Some(Action::SetHooks(self.hooks.clone()))
+            }
+        }
     }
 
     fn open_filter_picker(&mut self) {
@@ -1020,16 +1390,6 @@ mod tests {
         }
     }
 
-    trait WithCtrl {
-        fn with_ctrl(self) -> Self;
-    }
-    impl WithCtrl for KeyEvent {
-        fn with_ctrl(mut self) -> Self {
-            self.modifiers = KeyModifiers::CONTROL;
-            self
-        }
-    }
-
     fn view(id: usize) -> TorrentView {
         TorrentView {
             id,
@@ -1058,7 +1418,13 @@ mod tests {
         assert_eq!(app.mode, Mode::Add);
         app.handle_paste("magnet:?xt=urn:btih:abc\n");
         let a = app.handle_key(key(KeyCode::Enter));
-        assert_eq!(a, Some(Action::Add("magnet:?xt=urn:btih:abc".into())));
+        assert_eq!(
+            a,
+            Some(Action::Add {
+                input: "magnet:?xt=urn:btih:abc".into(),
+                tags: vec![]
+            })
+        );
         assert_eq!(app.mode, Mode::Normal);
     }
 
@@ -1388,7 +1754,10 @@ mod tests {
         let chosen = app.theme.name.clone();
         assert_eq!(
             app.handle_key(key(KeyCode::Enter)),
-            Some(Action::SaveTheme(chosen.clone()))
+            Some(Action::SaveTheme {
+                name: chosen.clone(),
+                transparent: None
+            })
         );
         assert_eq!(app.theme.name, chosen);
 
@@ -1541,12 +1910,15 @@ mod tests {
     }
 
     #[test]
-    fn tag_editor_saves_normalised_tags() {
+    fn tag_editor_adds_new_tags_normalised() {
         let mut app = App::new(String::new());
         app.update_torrents(vec![tview(1)]);
         app.handle_key(key(KeyCode::Char('t')));
         assert_eq!(app.mode, Mode::Tags);
         app.handle_paste("Movies, #4K  movies\n");
+        // First Enter adds what was typed, the second saves.
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), None);
+        assert_eq!(app.mode, Mode::Tags);
         let a = app.handle_key(key(KeyCode::Enter));
         assert_eq!(
             a,
@@ -1560,14 +1932,38 @@ mod tests {
     }
 
     #[test]
-    fn tag_editor_starts_with_current_tags_and_empty_clears() {
+    fn tag_editor_lists_known_tags_checked_for_this_torrent() {
+        let mut app = tagged_app();
+        // An action's tag is offered even though no torrent has it.
+        app.hooks = vec![HookSpec {
+            name: None,
+            run: vec!["x".into()],
+            tags: vec!["sport".into()],
+            timeout_secs: 5,
+        }];
+        app.handle_key(key(KeyCode::Char('t')));
+        let rows: Vec<_> = app
+            .tag_editor
+            .as_ref()
+            .unwrap()
+            .list
+            .rows
+            .iter()
+            .map(|r| (r.name.as_str(), r.checked, r.count))
+            .collect();
+        assert_eq!(
+            rows,
+            [("4k", true, 1), ("movies", true, 2), ("sport", false, 0)]
+        );
+    }
+
+    #[test]
+    fn unchecking_every_tag_clears_them() {
         let mut app = tagged_app();
         app.handle_key(key(KeyCode::Char('t')));
-        assert_eq!(app.tag_editor.as_ref().unwrap().input.text(), "4k movies");
-        let in_use = &app.tag_editor.as_ref().unwrap().in_use;
-        assert_eq!(in_use, &[("4k".to_string(), 1), ("movies".to_string(), 2)]);
-
-        app.handle_key(key(KeyCode::Char('u')).with_ctrl());
+        app.handle_key(key(KeyCode::Char(' ')));
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Char(' ')));
         let a = app.handle_key(key(KeyCode::Enter));
         assert_eq!(
             a,
@@ -1580,16 +1976,33 @@ mod tests {
     }
 
     #[test]
+    fn checking_an_existing_tag_adds_it_to_the_torrent() {
+        let mut app = tagged_app();
+        app.handle_key(key(KeyCode::Down)); // torrent 2: movies
+        app.handle_key(key(KeyCode::Char('t')));
+        app.handle_key(key(KeyCode::Char(' '))); // 4k on
+        let a = app.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            a,
+            Some(Action::SetTags {
+                info_hash: "h2".into(),
+                tags: vec!["4k".into(), "movies".into()],
+            })
+        );
+    }
+
+    #[test]
     fn tag_editor_rejects_bad_tags_and_stays_open() {
         let mut app = tagged_app();
         app.handle_key(key(KeyCode::Char('t')));
-        type_str(&mut app, " bad!");
+        type_str(&mut app, "bad!");
         assert_eq!(app.handle_key(key(KeyCode::Enter)), None);
         assert_eq!(app.mode, Mode::Tags);
         assert!(
             app.tag_editor
                 .as_ref()
                 .unwrap()
+                .list
                 .error
                 .as_ref()
                 .unwrap()
@@ -1598,7 +2011,7 @@ mod tests {
         // Nothing was applied, and editing clears the error.
         assert_eq!(app.tags["h1"], ["4k", "movies"]);
         app.handle_key(key(KeyCode::Backspace));
-        assert!(app.tag_editor.as_ref().unwrap().error.is_none());
+        assert!(app.tag_editor.as_ref().unwrap().list.error.is_none());
         // Esc discards without touching the tags.
         app.handle_key(key(KeyCode::Esc));
         assert_eq!(app.mode, Mode::Normal);
@@ -1698,10 +2111,9 @@ mod tests {
         app.filter = Filter::Tag("4k".into());
         app.refresh_view();
         assert_eq!(visible_ids(&app), [1]);
-        // Removing the only "4k" tag empties the filter, which resets itself.
+        // Unticking the only "4k" tag empties the filter, which resets itself.
         app.handle_key(key(KeyCode::Char('t')));
-        app.handle_key(key(KeyCode::Char('u')).with_ctrl());
-        type_str(&mut app, "movies");
+        app.handle_key(key(KeyCode::Char(' ')));
         app.handle_key(key(KeyCode::Enter));
         assert_eq!(app.filter, Filter::All);
         assert_eq!(visible_ids(&app), [1, 2, 3]);
@@ -1711,6 +2123,7 @@ mod tests {
     fn state(torrents: Vec<TorrentView>) -> State {
         State {
             torrents,
+            hooks: vec![],
             tags: Tags::new(),
             download_limit: None,
             upload_limit: None,
@@ -1925,5 +2338,397 @@ mod tests {
         let mut empty = App::new(String::new());
         empty.has_actions = true;
         assert_eq!(empty.handle_key(key(KeyCode::Char('x'))), None);
+    }
+
+    fn hook(name: &str, tags: &[&str]) -> HookSpec {
+        HookSpec {
+            name: Some(name.into()),
+            run: vec!["prog".into(), "{path}".into()],
+            tags: tags.iter().map(|t| t.to_string()).collect(),
+            timeout_secs: 60,
+        }
+    }
+
+    #[test]
+    fn state_carries_the_hooks_and_enables_the_x_key() {
+        let mut app = App::new(String::new());
+        assert!(!app.has_actions);
+        let mut st = state(vec![]);
+        st.hooks = vec![hook("a", &[])];
+        app.apply_state(st);
+        assert!(app.has_actions);
+        assert_eq!(app.hooks.len(), 1);
+        app.apply_state(state(vec![]));
+        assert!(!app.has_actions);
+    }
+
+    #[test]
+    fn hook_manager_adds_an_action_from_the_form() {
+        let mut app = tagged_app();
+        app.handle_key(key(KeyCode::Char('A')));
+        assert_eq!(app.mode, Mode::Hooks);
+        app.handle_key(key(KeyCode::Char('a')));
+        assert_eq!(app.mode, Mode::HookEdit);
+        type_str(&mut app, "sort");
+        app.handle_key(key(KeyCode::Tab));
+        type_str(&mut app, "prog {path}");
+        // Pick a tag from the list (4k is first), then save.
+        app.handle_key(key(KeyCode::Tab));
+        app.handle_key(key(KeyCode::Tab));
+        app.handle_key(key(KeyCode::Char(' ')));
+        let a = app.handle_key(key(KeyCode::Enter));
+        let expected = HookSpec {
+            name: Some("sort".into()),
+            run: vec!["prog".into(), "{path}".into()],
+            tags: vec!["4k".into()],
+            timeout_secs: 600,
+        };
+        assert_eq!(a, Some(Action::SetHooks(vec![expected.clone()])));
+        assert_eq!(app.mode, Mode::Hooks);
+        assert_eq!(app.hooks, [expected]);
+        assert!(app.has_actions);
+    }
+
+    #[test]
+    fn hook_form_errors_keep_it_open_and_esc_goes_back() {
+        let mut app = tagged_app();
+        app.handle_key(key(KeyCode::Char('A')));
+        app.handle_key(key(KeyCode::Char('a')));
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), None);
+        assert_eq!(app.mode, Mode::HookEdit);
+        assert!(
+            app.hook_editor
+                .as_ref()
+                .unwrap()
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("command is required")
+        );
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.mode, Mode::Hooks);
+        assert!(app.hooks.is_empty());
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn hook_manager_edits_and_deletes_with_confirmation() {
+        let mut app = App::new(String::new());
+        app.hooks = vec![hook("a", &[]), hook("b", &["x"])];
+        app.handle_key(key(KeyCode::Char('A')));
+        app.handle_key(key(KeyCode::Down));
+        // Edit: the form is prefilled, and saving replaces in place.
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.mode, Mode::HookEdit);
+        assert_eq!(app.hook_editor.as_ref().unwrap().name.text(), "b");
+        type_str(&mut app, "2");
+        let a = app.handle_key(key(KeyCode::Enter));
+        assert!(
+            matches!(&a, Some(Action::SetHooks(h)) if h.len() == 2 && h[1].name.as_deref() == Some("b2"))
+        );
+        assert_eq!(app.hooks[0].name.as_deref(), Some("a"));
+
+        // Delete asks first; anything but y cancels.
+        app.handle_key(key(KeyCode::Char('d')));
+        assert_eq!(app.handle_key(key(KeyCode::Char('x'))), None);
+        assert_eq!(app.hooks.len(), 2);
+        app.handle_key(key(KeyCode::Char('d')));
+        app.handle_key(key(KeyCode::Char('n')));
+        assert_eq!(app.hooks.len(), 2);
+        app.handle_key(key(KeyCode::Char('d')));
+        let a = app.handle_key(key(KeyCode::Char('y')));
+        assert!(
+            matches!(&a, Some(Action::SetHooks(h)) if h.len() == 1 && h[0].name.as_deref() == Some("a"))
+        );
+        assert_eq!(app.hook_manager.as_ref().unwrap().cursor, 0);
+        app.handle_key(key(KeyCode::Char('d')));
+        let a = app.handle_key(key(KeyCode::Char('y')));
+        assert_eq!(a, Some(Action::SetHooks(vec![])));
+        assert!(!app.has_actions);
+    }
+
+    #[test]
+    fn deleting_a_tag_removes_it_everywhere() {
+        let mut app = tagged_app();
+        app.hooks = vec![hook("both", &["movies", "tv"]), hook("all", &[])];
+        app.filter = Filter::Tag("4k".into());
+        app.refresh_view();
+        app.handle_key(key(KeyCode::Char('t')));
+        // Rows: 4k (cursor), movies, tv. Ask to delete 4k, then confirm.
+        app.handle_key(key(KeyCode::Delete));
+        assert_eq!(app.handle_key(key(KeyCode::Char('x'))), None, "x backs out");
+        assert_eq!(app.tags["h1"], ["4k", "movies"]);
+        app.handle_key(key(KeyCode::Delete));
+        let a = app.handle_key(key(KeyCode::Char('y')));
+        assert_eq!(a, Some(Action::DeleteTag("4k".into())));
+        assert_eq!(app.tags["h1"], ["movies"]);
+        assert_eq!(app.mode, Mode::Tags, "editor stays open");
+        let names: Vec<_> = app
+            .tag_editor
+            .as_ref()
+            .unwrap()
+            .list
+            .rows
+            .iter()
+            .map(|r| r.name.as_str())
+            .collect();
+        assert_eq!(names, ["movies", "tv"]);
+        assert_eq!(
+            app.filter,
+            Filter::All,
+            "a filter on the deleted tag resets"
+        );
+
+        // Tags drop out of actions that have others; none are left bare.
+        app.handle_key(key(KeyCode::Down)); // tv
+        app.handle_key(key(KeyCode::Delete));
+        let a = app.handle_key(key(KeyCode::Char('y')));
+        assert_eq!(a, Some(Action::DeleteTag("tv".into())));
+        assert_eq!(app.hooks[0].tags, ["movies"]);
+    }
+
+    #[test]
+    fn a_tag_that_an_action_depends_on_cannot_be_deleted() {
+        let mut app = tagged_app();
+        app.hooks = vec![hook("only movies", &["movies"])];
+        app.handle_key(key(KeyCode::Char('t')));
+        app.handle_key(key(KeyCode::Down)); // movies
+        app.handle_key(key(KeyCode::Delete));
+        assert_eq!(app.handle_key(key(KeyCode::Char('y'))), None);
+        let err = app.tag_editor.as_ref().unwrap().list.error.clone().unwrap();
+        assert!(
+            err.contains("only movies") && err.contains("only runs for #movies"),
+            "{err}"
+        );
+        assert_eq!(app.tags["h2"], ["movies"]);
+        assert_eq!(app.tag_editor.as_ref().unwrap().list.rows.len(), 2);
+    }
+
+    #[test]
+    fn esc_cancels_a_pending_delete_before_closing_the_editor() {
+        let mut app = tagged_app();
+        app.handle_key(key(KeyCode::Char('t')));
+        app.handle_key(key(KeyCode::Delete));
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.mode, Mode::Tags);
+        assert!(
+            app.tag_editor
+                .as_ref()
+                .unwrap()
+                .list
+                .confirm_delete
+                .is_none()
+        );
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn capital_e_asks_to_edit_the_config_only_from_the_list() {
+        let mut app = App::new(String::new());
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('E'))),
+            Some(Action::EditConfig)
+        );
+        // Typing a capital E into a dialog is just text.
+        app.handle_key(key(KeyCode::Char('a')));
+        assert_eq!(app.handle_key(key(KeyCode::Char('E'))), None);
+        assert_eq!(app.input.text(), "E");
+    }
+
+    #[test]
+    fn theme_picker_toggles_background_with_b_and_saves_only_a_change() {
+        let mut app = App::new(String::new());
+        app.set_themes(theme::builtin_themes(), "dracula");
+        assert!(app.transparent);
+        assert_eq!(app.theme.bg, ratatui::style::Color::Reset);
+        // B no longer does anything outside the picker.
+        assert_eq!(app.handle_key(key(KeyCode::Char('B'))), None);
+        assert!(app.transparent);
+
+        // Previewed live; cancelling puts the old setting back.
+        app.handle_key(key(KeyCode::Char('T')));
+        app.handle_key(key(KeyCode::Char('b')));
+        assert!(!app.transparent);
+        assert_ne!(app.theme.bg, ratatui::style::Color::Reset);
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.transparent);
+        assert_eq!(app.theme.bg, ratatui::style::Color::Reset);
+
+        // Saving reports the change, and the previewed theme keeps it.
+        app.handle_key(key(KeyCode::Char('T')));
+        app.handle_key(key(KeyCode::Char('b')));
+        app.handle_key(key(KeyCode::Down));
+        assert_ne!(app.theme.bg, ratatui::style::Color::Reset, "still opaque");
+        let a = app.handle_key(key(KeyCode::Enter));
+        let name = app.theme.name.clone();
+        assert_eq!(
+            a,
+            Some(Action::SaveTheme {
+                name,
+                transparent: Some(false)
+            })
+        );
+        assert!(!app.transparent);
+
+        // Reopening and just choosing a theme leaves the setting alone.
+        app.handle_key(key(KeyCode::Char('T')));
+        let a = app.handle_key(key(KeyCode::Enter));
+        assert!(matches!(
+            a,
+            Some(Action::SaveTheme {
+                transparent: None,
+                ..
+            })
+        ));
+    }
+
+    fn add_with(app: &mut App, link: &str) {
+        app.handle_key(key(KeyCode::Char('a')));
+        app.handle_paste(link);
+    }
+
+    #[test]
+    fn add_dialog_sends_the_ticked_tags() {
+        let mut app = tagged_app();
+        add_with(&mut app, "magnet:?xt=urn:btih:abc");
+        // Tab to the list (4k, movies), tick movies, Enter on a tag saves.
+        app.handle_key(key(KeyCode::Tab));
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Char(' ')));
+        let a = app.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            a,
+            Some(Action::Add {
+                input: "magnet:?xt=urn:btih:abc".into(),
+                tags: vec!["movies".into()],
+            })
+        );
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.add_tags.is_none());
+    }
+
+    #[test]
+    fn add_dialog_creates_a_new_tag_and_enter_in_the_link_field_submits() {
+        let mut app = tagged_app();
+        add_with(&mut app, "magnet:?xt=urn:btih:abc");
+        app.handle_key(key(KeyCode::Down)); // into the tag list
+        type_str(&mut app, "Fresh");
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter)),
+            None,
+            "Enter adds the tag"
+        );
+        assert_eq!(app.mode, Mode::Add);
+        app.handle_key(key(KeyCode::Tab)); // back to the link
+        let a = app.handle_key(key(KeyCode::Enter));
+        assert!(matches!(
+            &a,
+            Some(Action::Add { tags, .. }) if tags == &["fresh".to_string()]
+        ));
+
+        // No tags chosen: an ordinary add.
+        let mut app = tagged_app();
+        add_with(&mut app, "magnet:?xt=urn:btih:def");
+        assert!(matches!(
+            app.handle_key(key(KeyCode::Enter)),
+            Some(Action::Add { tags, .. }) if tags.is_empty()
+        ));
+    }
+
+    #[test]
+    fn typing_in_the_link_field_does_not_touch_the_tag_list() {
+        let mut app = tagged_app();
+        add_with(&mut app, "");
+        type_str(&mut app, "dTq ");
+        assert_eq!(app.input.text(), "dTq ");
+        assert!(!app.add_focus_tags);
+        assert_eq!(app.mode, Mode::Add);
+    }
+
+    #[test]
+    fn new_torrents_from_elsewhere_prompt_for_tags_once() {
+        let mut app = App::new(String::new());
+        app.ask_tags = true;
+        app.update_torrents(vec![tview(1)]);
+        app.open_next_tag_prompt();
+        assert_eq!(
+            app.mode,
+            Mode::Normal,
+            "what was already there is not prompted"
+        );
+
+        app.update_torrents(vec![tview(1), tview(2)]);
+        app.open_next_tag_prompt();
+        assert_eq!(app.mode, Mode::Tags);
+        let editor = app.tag_editor.as_ref().unwrap();
+        assert!(editor.prompt && editor.name == "t2");
+
+        // Tag it like any other.
+        app.handle_paste("anime");
+        app.handle_key(key(KeyCode::Enter));
+        let a = app.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            a,
+            Some(Action::SetTags {
+                info_hash: "h2".into(),
+                tags: vec!["anime".into()],
+            })
+        );
+        // Not asked again, and Esc skips without tagging.
+        app.update_torrents(vec![tview(1), tview(2), tview(3)]);
+        app.open_next_tag_prompt();
+        assert_eq!(app.mode, Mode::Tags);
+        app.handle_key(key(KeyCode::Esc));
+        app.open_next_tag_prompt();
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(!app.tags.contains_key("h3"));
+    }
+
+    #[test]
+    fn tag_prompts_wait_for_other_dialogs_and_skip_tagged_or_gone_torrents() {
+        let mut app = App::new(String::new());
+        app.ask_tags = true;
+        app.update_torrents(vec![tview(1)]);
+        app.update_torrents(vec![tview(1), tview(2), tview(3)]);
+        app.handle_key(key(KeyCode::Char('l')));
+        app.open_next_tag_prompt();
+        assert_eq!(app.mode, Mode::Limits, "must not steal focus");
+        app.handle_key(key(KeyCode::Esc));
+        // Torrent 2 got tagged elsewhere meanwhile, so 3 is offered.
+        let mut tags = Tags::new();
+        tags.insert("h2".into(), vec!["x".into()]);
+        app.set_tags(tags);
+        app.open_next_tag_prompt();
+        assert_eq!(app.tag_editor.as_ref().unwrap().name, "t3");
+        app.handle_key(key(KeyCode::Esc));
+        // A torrent that vanished is dropped quietly.
+        app.update_torrents(vec![tview(1), tview(4)]);
+        app.update_torrents(vec![tview(1)]);
+        app.open_next_tag_prompt();
+        assert_eq!(app.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn torrents_added_here_or_with_the_setting_off_are_not_prompted() {
+        let mut app = App::new(String::new());
+        app.ask_tags = true;
+        app.update_torrents(vec![tview(1)]);
+        add_with(&mut app, "magnet:?xt=urn:btih:abc");
+        app.handle_key(key(KeyCode::Enter));
+        app.update_torrents(vec![tview(1), tview(2)]);
+        app.open_next_tag_prompt();
+        assert_eq!(app.mode, Mode::Normal, "its tags were chosen in the dialog");
+        // The next arrival, from a browser, is.
+        app.update_torrents(vec![tview(1), tview(2), tview(3)]);
+        app.open_next_tag_prompt();
+        assert_eq!(app.mode, Mode::Tags);
+
+        let mut off = App::new(String::new());
+        off.update_torrents(vec![tview(1)]);
+        off.update_torrents(vec![tview(1), tview(2)]);
+        off.open_next_tag_prompt();
+        assert_eq!(off.mode, Mode::Normal);
     }
 }

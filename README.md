@@ -47,16 +47,18 @@ files, so a few bytes of an unselected neighbour may still be written.
 
 | Key | Action |
 | --- | --- |
-| `a` | Add magnet / URL / file |
+| `a` | Add magnet / URL / file; `Tab` switches to a tag list (tick known tags or type a new one) so it is tagged as it is added |
 | `p`, `Space` | Pause / resume |
 | `f`, `Enter` | Choose which files to download |
 | `F` | Show / hide a side panel with each file's download progress (`PgUp`/`PgDn` scroll it) |
 | `d`, `Del` | Remove the torrent, keep its files (asks first) |
 | `D` | Remove the torrent **and delete its data** (asks first) |
 | `x` | Run the `on_complete` actions on a finished torrent |
-| `t` | Edit the selected torrent's tags |
+| `t` | Add or remove tags: tick known tags with `Space`, type a new one and press `Enter`; `Del` deletes the highlighted tag from every torrent and action (asks first) |
+| `E` | Open the config file in `$VISUAL` / `$EDITOR` (else `vi`); changes apply after `torrentui daemon restart` |
+| `A` | Manage the [`on_complete` actions](#actions-after-a-download) (add, edit, delete) |
 | `/` | Filter the list by tag (`Esc` shows everything again) |
-| `T` | Theme picker with live preview (saved) |
+| `T` | Theme picker with live preview (saved); `b` inside it toggles a transparent background |
 | `l` | Speed limits (saved) |
 | `↑↓`, `j k`, `g G` | Navigate |
 | `?` | Help |
@@ -233,6 +235,14 @@ clears it, and the speed totals in the header still cover every torrent. Tags
 show in the Details pane, and as a column when the terminal is at least 110
 columns wide.
 
+**Tagging on add.** The add dialog (`a`) has a tag list: press `Tab` to move
+to it, tick tags with `Space` or type a new one and press `Enter`. The daemon
+gives the torrent those tags as soon as it exists, including after a file
+selection. A torrent that arrives some other way (a browser link, another
+window) opens the same tag list in your window so you can tag it right away;
+`Esc` skips. Turn that off with `ask_tags: false`. With no window open it is
+added untagged.
+
 Tags are stored by info-hash in `<data>/torrentui/tags.yml`, so they
 survive restarts and renumbering, and are dropped when you remove the torrent.
 The file is plain YAML and safe to edit by hand while torrentui is closed;
@@ -251,9 +261,18 @@ only that torrent's file is deleted from it.
 ## Actions after a download
 
 Run your own commands when a torrent finishes, for example to sort files or
-send a notification. Define them in the config (read when the daemon starts, so `torrentui daemon
-restart` after editing). They run inside the daemon, so they work with no
-window open:
+send a notification. They run inside the daemon, so they work with no window
+open.
+
+**In the app:** press `A` for the list of actions. `a` adds one, `Enter` edits
+the selected one and `d` deletes it (after asking). The form has a name, the
+command, a timeout and a checklist of tags to limit it to. The checklist offers
+every tag in use plus tags other actions mention; type a new tag in its top
+field and press `Enter` to add it. Changes are saved to your config file (its
+other contents and comments are kept; comments *inside* the `on_complete` block
+are not) and take effect straight away.
+
+**By hand:** edit the config and run `torrentui daemon restart`:
 
 ```yaml
 on_complete:
@@ -302,9 +321,12 @@ max_upload_speed: 500KiB/s    #   "/s" optional; 0 = unlimited. Bits (Mbps) are 
 peer_limit: 0                 # max peers per torrent; 0 = engine default
 dht: true                     # trackerless peer discovery (needed for most magnets)
 ask_files: true               # show the file picker for multi-file torrents
+ask_tags: true                # offer tags for torrents that arrive from a browser/another window
+transparent_background: true  # false paints the theme's own background (toggle: T, then b)
 ```
 
-`T` and `l` inside the app write `theme`, `max_download_speed` and
+`T` and `l` inside the app write `theme`, `transparent_background`,
+`max_download_speed` and
 `max_upload_speed` back to this file. Only those lines change; your comments
 and everything else are left alone, and a symlinked config (e.g. managed by
 stow) stays a symlink. `download_dir`, `peer_limit` and `dht` take effect on the
@@ -313,26 +335,42 @@ next daemon restart (`torrentui daemon restart`).
 ### Themes
 
 Built in: `default` (your terminal's own ANSI colours), `tokyo-night`,
-`catppuccin-frappe`, `catppuccin-mocha`, `dracula`, `one-dark`. Names ignore
+`catppuccin-frappe`, `catppuccin-macchiato`, `catppuccin-mocha`,
+`catppuccin-latte` (light), `dracula`, `one-dark`,
+`gruvbox-dark`, `nord`, `solarized-dark`, `rose-pine`, `monokai`, `github-dark`,
+`everforest` and `kanagawa`. Names ignore
 case, accents and punctuation (`Catppuccin Frappé` works). Everything except
 `default` uses 24-bit colour, so use a true-colour terminal.
 
-Define your own, or tweak a built-in, under `themes:`. Every colour is optional
-and inherits from `base` (a built-in, default `default`). Colours are
-`#rrggbb`, an ANSI name (`red`, `lightblue`) or a 0-255 index. Reusing a
-built-in's name replaces it.
+**Theme files.** On start, each built-in theme that has no file yet is written
+to `~/.config/torrentui/themes/<name>.yml` (next to your `config.yml`), and
+every `.yml` in that folder is offered in the picker. Edit a file to change a
+theme, or add a new one: the file name is the theme's name. A built-in whose
+file you delete comes back on the next start. A file that sets
+`base: <built-in>` only needs the colours that differ; a file named like a
+built-in and without `base` also inherits from that built-in.
 
 ```yaml
-themes:
-  my-theme:
-    base: dracula
-    accent: "#ff79c6"
-    fg: "#f8f8f2"
+# ~/.config/torrentui/themes/my-theme.yml
+base: dracula
+accent: "#ff79c6"
+bg: "#101010"
 ```
 
-Colour keys: `fg muted accent border selection_bg success info warning error special`
+You can still define themes under `themes:` in `config.yml`; those are applied
+last and layer over a file of the same name. Every colour is optional.
+Colours are `#rrggbb`, an ANSI name (`red`, `lightblue`) or a 0-255 index.
+
+Colour keys: `bg fg muted accent border selection_bg success info warning error special`
 (`success` = downloading, `info` = seeding/upload, `warning` = paused,
-`special` = checking). Themes never set a background, so terminal transparency is preserved.
+`special` = checking).
+
+**Background.** Themes have a page colour (`bg`). With
+`transparent_background: true` (the default) it is not painted, so your
+terminal's own background, transparency and blur show through; set it to
+`false`, or press `b` in the theme picker (`T`), to paint the theme's
+background, including behind popups. `default` has no background of its own,
+so the setting changes nothing there.
 
 ## Where data lives
 

@@ -19,7 +19,7 @@ use std::{
 };
 
 use color_eyre::eyre::{Result, WrapErr, bail, eyre};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     config,
@@ -36,20 +36,105 @@ fn default_timeout() -> u64 {
 }
 
 /// One `on_complete` entry as written in the config file.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HookSpec {
     /// Label shown in messages and the log; defaults to the program name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     /// The program followed by its arguments. Placeholders `{path}`, `{name}`,
     /// `{hash}` and `{tags}` are replaced in the arguments.
     pub run: Vec<String>,
     /// Only run for torrents having at least one of these tags (empty: all).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
     /// Kill the command after this many seconds; 0 means no limit.
     #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
+}
+
+/// Split a command line the way a user types it: whitespace separates
+/// arguments, `'…'` is literal, `"…"` allows `\\` and `\"`, and a backslash
+/// outside quotes escapes the next character. No shell is involved; this only
+/// turns the editor's single line into the `run` list.
+pub fn split_command(line: &str) -> Result<Vec<String>, String> {
+    let mut args = Vec::new();
+    let mut cur = String::new();
+    let mut in_arg = false;
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            c if c.is_whitespace() => {
+                if in_arg {
+                    args.push(std::mem::take(&mut cur));
+                    in_arg = false;
+                }
+            }
+            '\'' => {
+                in_arg = true;
+                loop {
+                    match chars.next() {
+                        Some('\'') => break,
+                        Some(c) => cur.push(c),
+                        None => return Err("unclosed ' quote".into()),
+                    }
+                }
+            }
+            '"' => {
+                in_arg = true;
+                loop {
+                    match chars.next() {
+                        Some('"') => break,
+                        Some('\\') => match chars.next() {
+                            Some(c @ ('"' | '\\')) => cur.push(c),
+                            Some(c) => {
+                                cur.push('\\');
+                                cur.push(c);
+                            }
+                            None => return Err("unclosed \" quote".into()),
+                        },
+                        Some(c) => cur.push(c),
+                        None => return Err("unclosed \" quote".into()),
+                    }
+                }
+            }
+            '\\' => {
+                in_arg = true;
+                match chars.next() {
+                    Some(c) => cur.push(c),
+                    None => cur.push('\\'),
+                }
+            }
+            c => {
+                in_arg = true;
+                cur.push(c);
+            }
+        }
+    }
+    if in_arg {
+        args.push(cur);
+    }
+    Ok(args)
+}
+
+/// The inverse of [`split_command`]: quote only the arguments that need it.
+pub fn join_command(args: &[String]) -> String {
+    args.iter()
+        .map(|a| {
+            let plain = !a.is_empty()
+                && !a
+                    .chars()
+                    .any(|c| c.is_whitespace() || matches!(c, '\'' | '"' | '\\'));
+            if plain {
+                a.clone()
+            } else if !a.contains('\'') {
+                format!("'{a}'")
+            } else {
+                format!("\"{}\"", a.replace('\\', "\\\\").replace('"', "\\\""))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// A validated action.
@@ -733,5 +818,28 @@ mod tests {
         assert!(dir.join("actions.log.1").exists());
         assert_eq!(fs::metadata(&log).unwrap().len(), 0);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn command_lines_split_and_join_round_trip() {
+        let s = |t: &str| split_command(t).unwrap();
+        assert_eq!(s("a b  c"), ["a", "b", "c"]);
+        assert_eq!(
+            s("~/bin/x.sh '{path}' \"two words\""),
+            ["~/bin/x.sh", "{path}", "two words"]
+        );
+        assert_eq!(s("a\\ b"), ["a b"]);
+        assert_eq!(s("''"), [""]);
+        assert!(s("   ").is_empty());
+        assert!(split_command("a 'b").is_err());
+        assert!(split_command("a \"b").is_err());
+        for args in [
+            vec!["plain", "{path}", "-x"],
+            vec!["two words", "it's", "say \"hi\"", "back\\slash", ""],
+        ] {
+            let args: Vec<String> = args.into_iter().map(String::from).collect();
+            assert_eq!(split_command(&join_command(&args)).unwrap(), args);
+        }
+        assert_eq!(join_command(&["a".into(), "b c".into()]), "a 'b c'");
     }
 }

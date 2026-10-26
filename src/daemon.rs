@@ -24,7 +24,7 @@ use tokio::{
 };
 
 use crate::{
-    actions::{self, Context, Hook, Tracker},
+    actions::{self, Context, Hook, HookSpec, Tracker},
     config::{self, Rate},
     desktop,
     engine::{Engine, EngineOptions, Prepared, Status, TorrentView},
@@ -54,6 +54,8 @@ pub struct Options {
 
 struct Picker {
     name: String,
+    /// Tags to give the torrent once the files are chosen.
+    tags: Vec<String>,
     files: crate::engine::FileList,
     torrent_bytes: Vec<u8>,
 }
@@ -61,6 +63,10 @@ struct Picker {
 #[derive(Default)]
 struct Shared {
     tags: Tags,
+    /// The `on_complete` actions: the validated form the runner uses, and
+    /// the spec form windows edit. Changed live by `SetHooks`.
+    hooks: Vec<Hook>,
+    hook_specs: Vec<HookSpec>,
     tracker: Tracker,
     pickers: BTreeMap<u64, Picker>,
     next_token: u64,
@@ -75,7 +81,6 @@ struct Shared {
 
 struct Inner {
     engine: Engine,
-    hooks: Vec<Hook>,
     log: PathBuf,
     tags_path: PathBuf,
     config_path: PathBuf,
@@ -128,6 +133,7 @@ impl Inner {
                 .collect(),
             adding: s.adding,
             actions_running: s.actions_running,
+            hooks: s.hook_specs.clone(),
         }
     }
 
@@ -232,7 +238,6 @@ pub async fn run(opts: Options) -> Result<()> {
     let (push, _) = broadcast::channel(16);
     let inner = Arc::new(Inner {
         engine,
-        hooks,
         log: actions::log_path()?,
         tags_path,
         config_path: opts.config_path,
@@ -243,6 +248,8 @@ pub async fn run(opts: Options) -> Result<()> {
         started: Instant::now(),
         shared: Mutex::new(Shared {
             tags,
+            hooks,
+            hook_specs: cfg.on_complete.clone(),
             tracker,
             limits: (
                 limit(cfg.max_download_speed.bps()),
@@ -307,7 +314,7 @@ async fn tick_loop(inner: Arc<Inner>) {
     loop {
         tick.tick().await;
         let views = inner.engine.snapshot();
-        if !inner.hooks.is_empty() {
+        if !inner.shared().hooks.is_empty() {
             let finished = inner.shared().tracker.observe(&views);
             inner.save_tracker();
             for hash in finished {
@@ -337,6 +344,7 @@ fn spawn_actions(
         .cloned()
         .unwrap_or_default();
     let hooks: Vec<Hook> = inner
+        .shared()
         .hooks
         .iter()
         .filter(|h| h.applies_to(&tags))
@@ -435,13 +443,16 @@ async fn handle_conn(inner: Arc<Inner>, stream: UnixStream) {
     });
     let mut push = subscribe.then(|| inner.push.subscribe());
 
+    // Not inline in the literal below: that guard would live to the end of the
+    // statement and deadlock the `notice` lock taken next to it.
+    let has_actions = !inner.shared().hooks.is_empty();
     let welcome = Welcome {
         version: proto::VERSION,
         pid: std::process::id(),
         download_dir: inner.download_dir.display().to_string(),
         config_path: inner.config_path.display().to_string(),
         ask_files: inner.ask_files,
-        has_actions: !inner.hooks.is_empty(),
+        has_actions,
         notice: if subscribe {
             inner.shared().notice.take()
         } else {
@@ -504,11 +515,13 @@ async fn handle(inner: &Arc<Inner>, req: Request) -> Result<Reply, String> {
     let err = |e: color_eyre::Report| format!("{e:#}");
     match req {
         Request::Hello { .. } => Err("already greeted".into()),
-        Request::Add { input } => {
+        Request::Add { input, tags } => {
             let input = input.trim().to_string();
             if input.is_empty() {
                 return Err("nothing to add".into());
             }
+            // Never trust the client's normalisation.
+            let tags = tags::parse_tags(&tags.join(" "))?;
             {
                 let mut s = inner.shared();
                 if s.adding >= MAX_ADDING {
@@ -516,7 +529,7 @@ async fn handle(inner: &Arc<Inner>, req: Request) -> Result<Reply, String> {
                 }
                 s.adding += 1;
             }
-            tokio::spawn(do_add(inner.clone(), input));
+            tokio::spawn(do_add(inner.clone(), input, tags));
             Ok(Reply::Ok)
         }
         Request::TogglePause { id } => {
@@ -564,7 +577,10 @@ async fn handle(inner: &Arc<Inner>, req: Request) -> Result<Reply, String> {
             };
             let name = picker.name.clone();
             match inner.engine.add_prepared(picker.torrent_bytes, only).await {
-                Ok(_) => message(format!("Added: {name}"), false),
+                Ok(added) => {
+                    apply_new_tags(inner, &added.info_hash, &picker.tags);
+                    message(format!("Added: {name}"), false)
+                }
                 Err(e) => Err(format!("Add failed: {e:#}")),
             }
         }
@@ -620,6 +636,74 @@ async fn handle(inner: &Arc<Inner>, req: Request) -> Result<Reply, String> {
                 Err(e) => message(format!("Tags applied but not saved: {e:#}"), true),
             }
         }
+        Request::DeleteTag { tag } => {
+            let tag = match tags::parse_tags(&tag)?.as_slice() {
+                [one] => one.clone(),
+                _ => return Err("give exactly one tag".into()),
+            };
+            let (mut new_specs, mut new_tags) = {
+                let s = inner.shared();
+                (s.hook_specs.clone(), s.tags.clone())
+            };
+            // An action limited to just this tag would start running for
+            // everything, so make the user decide about it first.
+            if let Some(h) = new_specs.iter().find(|h| h.tags == [tag.clone()]) {
+                let label = h
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| actions::join_command(&h.run));
+                return Err(format!(
+                    "Action \"{label}\" only runs for #{tag}: edit or delete it first"
+                ));
+            }
+            let mut actions_changed = 0;
+            for h in new_specs.iter_mut().filter(|h| h.tags.contains(&tag)) {
+                h.tags.retain(|t| *t != tag);
+                actions_changed += 1;
+            }
+            let mut torrents = 0;
+            for list in new_tags.values_mut() {
+                if list.contains(&tag) {
+                    list.retain(|t| *t != tag);
+                    torrents += 1;
+                }
+            }
+            new_tags.retain(|_, v| !v.is_empty());
+            if actions_changed > 0 {
+                let resolved = actions::resolve(&new_specs).map_err(|e| format!("{e:#}"))?;
+                config::set_on_complete(&inner.config_path, &new_specs)
+                    .map_err(|e| format!("cannot save {}: {e:#}", inner.config_path.display()))?;
+                let mut s = inner.shared();
+                s.hooks = resolved;
+                s.hook_specs = new_specs;
+            }
+            inner.shared().tags = new_tags;
+            let summary =
+                format!("Deleted #{tag} ({torrents} torrent(s), {actions_changed} action(s))");
+            match inner.save_tags() {
+                Ok(()) => message(summary, false),
+                Err(e) => message(format!("{summary}, but tags not saved: {e:#}"), true),
+            }
+        }
+        Request::SetHooks { hooks } => {
+            let resolved = actions::resolve(&hooks).map_err(|e| format!("{e:#}"))?;
+            config::set_on_complete(&inner.config_path, &hooks)
+                .map_err(|e| format!("cannot save {}: {e:#}", inner.config_path.display()))?;
+            let n = hooks.len();
+            {
+                let mut s = inner.shared();
+                s.hooks = resolved;
+                s.hook_specs = hooks;
+            }
+            message(
+                match n {
+                    0 => "Actions cleared".to_string(),
+                    1 => "1 action saved".to_string(),
+                    n => format!("{n} actions saved"),
+                },
+                false,
+            )
+        }
         Request::RunActions { id } => {
             let view = inner
                 .engine
@@ -648,11 +732,28 @@ async fn handle(inner: &Arc<Inner>, req: Request) -> Result<Reply, String> {
     }
 }
 
+/// Give a just-added torrent its tags, keeping any it already has.
+fn apply_new_tags(inner: &Inner, info_hash: &str, new: &[String]) {
+    if new.is_empty() {
+        return;
+    }
+    {
+        let mut s = inner.shared();
+        let list = s.tags.entry(info_hash.to_string()).or_default();
+        list.extend(new.iter().cloned());
+        list.sort();
+        list.dedup();
+    }
+    if let Err(e) = inner.save_tags() {
+        inner.notice(format!("Tags applied but not saved: {e:#}"), true);
+    }
+}
+
 /// Resolve a torrent's metadata and either start it or park it for a file
 /// selection. Runs detached: magnets can take a while.
-async fn do_add(inner: Arc<Inner>, input: String) {
+async fn do_add(inner: Arc<Inner>, input: String, tags: Vec<String>) {
     enum Done {
-        Added(String),
+        Added(crate::engine::Added),
         Pick(Prepared),
     }
     let outcome: Result<Done> = async {
@@ -661,11 +762,11 @@ async fn do_add(inner: Arc<Inner>, input: String) {
             if p.files.entries.len() > 1 {
                 return Ok(Done::Pick(p));
             }
-            let name = inner
+            let added = inner
                 .engine
                 .add_prepared(p.torrent_bytes, p.files.all_indices())
                 .await?;
-            Ok(Done::Added(name))
+            Ok(Done::Added(added))
         } else {
             Ok(Done::Added(inner.engine.add(&input).await?))
         }
@@ -674,7 +775,10 @@ async fn do_add(inner: Arc<Inner>, input: String) {
     inner.shared().adding -= 1;
 
     match outcome {
-        Ok(Done::Added(name)) => inner.notice(format!("Added: {name}"), false),
+        Ok(Done::Added(added)) => {
+            apply_new_tags(&inner, &added.info_hash, &tags);
+            inner.notice(format!("Added: {}", added.name), false);
+        }
         Ok(Done::Pick(p)) => {
             let waiting = {
                 let mut s = inner.shared();
@@ -687,6 +791,7 @@ async fn do_add(inner: Arc<Inner>, input: String) {
                         token,
                         Picker {
                             name: p.name.clone(),
+                            tags: tags.clone(),
                             files: p.files,
                             torrent_bytes: p.torrent_bytes,
                         },

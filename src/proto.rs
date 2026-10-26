@@ -19,13 +19,14 @@ use tokio::io::{
 };
 
 use crate::{
+    actions::HookSpec,
     engine::{FileList, TorrentView},
     tags::Tags,
 };
 
 /// Bumped whenever the messages change incompatibly; checked on connect so a
 /// freshly upgraded client doesn't talk garbage to a stale daemon.
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 4;
 
 /// Upper bound for one message. Nothing legitimate comes close.
 const MAX_FRAME: usize = 8 * 1024 * 1024;
@@ -44,9 +45,12 @@ pub enum Request {
         version: u32,
         subscribe: bool,
     },
-    /// Add a magnet link, URL, info-hash or absolute .torrent path.
+    /// Add a magnet link, URL, info-hash or absolute .torrent path, giving
+    /// the torrent these tags once it exists.
     Add {
         input: String,
+        #[serde(default)]
+        tags: Vec<String>,
     },
     TogglePause {
         id: usize,
@@ -81,6 +85,15 @@ pub enum Request {
     },
     RunActions {
         id: usize,
+    },
+    /// Replace the `on_complete` actions: saved to the config file and put
+    /// into effect at once.
+    SetHooks {
+        hooks: Vec<HookSpec>,
+    },
+    /// Remove a tag from every torrent and from the actions' tag lists.
+    DeleteTag {
+        tag: String,
     },
     Status,
     Shutdown,
@@ -159,6 +172,8 @@ pub struct State {
     /// Adds still resolving metadata.
     pub adding: usize,
     pub actions_running: usize,
+    /// The configured `on_complete` actions.
+    pub hooks: Vec<HookSpec>,
 }
 
 pub async fn write_frame<W, T>(w: &mut W, msg: &T) -> std::io::Result<()>
@@ -296,6 +311,7 @@ mod tests {
                 id,
                 req: Request::Add {
                     input: format!("magnet:?xt=urn:btih:{id}\nwith newline \"quotes\""),
+                    tags: vec!["movies".into()],
                 },
             };
             write_frame(&mut wire, &msg).await.unwrap();
@@ -308,7 +324,7 @@ mod tests {
         for id in 0..3 {
             let m: ClientMsg = read_frame(&mut r, &mut buf).await.unwrap().unwrap();
             assert_eq!(m.id, id);
-            let Request::Add { input } = m.req else {
+            let Request::Add { input, .. } = m.req else {
                 panic!()
             };
             assert!(input.contains("with newline \"quotes\""));
@@ -363,6 +379,7 @@ mod tests {
             pickers: vec![],
             adding: 1,
             actions_running: 2,
+            hooks: vec![],
         };
         let json = serde_json::to_string(&ServerMsg::State(Box::new(state))).unwrap();
         assert!(matches!(

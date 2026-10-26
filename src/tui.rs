@@ -16,6 +16,7 @@ use ratatui::DefaultTerminal;
 use tokio::{sync::mpsc, time::MissedTickBehavior};
 
 use crate::{
+    actions,
     app::{Action, App, FilePicker, PickerTarget},
     client::{Client, Connection, Event as DaemonEvent},
     config,
@@ -34,6 +35,9 @@ pub struct Settings {
     pub config_path: PathBuf,
     pub themes: Vec<Theme>,
     pub theme_name: String,
+    pub transparent: bool,
+    /// Offer tags for torrents that arrive from a browser or another window.
+    pub ask_tags: bool,
     /// Torrents to add as soon as the window opens.
     pub inputs: Vec<String>,
 }
@@ -81,6 +85,40 @@ pub fn init_terminal() -> Result<DefaultTerminal> {
     Ok(terminal)
 }
 
+/// The editor command: `$VISUAL`, else `$EDITOR`, else `vi`, split like a
+/// command line so `code -w` works.
+fn editor_command(visual: Option<&str>, editor: Option<&str>) -> Result<Vec<String>> {
+    let spec = [visual, editor]
+        .into_iter()
+        .flatten()
+        .find(|s| !s.trim().is_empty())
+        .unwrap_or("vi");
+    let parts = actions::split_command(spec)
+        .map_err(|e| color_eyre::eyre::eyre!("cannot read $VISUAL/$EDITOR: {e}"))?;
+    Ok(parts)
+}
+
+/// Give the terminal to an editor and wait for it to exit.
+fn run_editor(path: &std::path::Path) -> Result<()> {
+    use color_eyre::eyre::{WrapErr, bail};
+    let parts = editor_command(
+        std::env::var("VISUAL").ok().as_deref(),
+        std::env::var("EDITOR").ok().as_deref(),
+    )?;
+    let Some((program, args)) = parts.split_first() else {
+        bail!("$VISUAL/$EDITOR is empty");
+    };
+    let status = std::process::Command::new(program)
+        .args(args)
+        .arg(path)
+        .status()
+        .wrap_err_with(|| format!("cannot start the editor '{program}'"))?;
+    if !status.success() {
+        bail!("{program} exited with {status}");
+    }
+    Ok(())
+}
+
 pub fn restore_terminal() {
     let _ = execute!(std::io::stdout(), DisableBracketedPaste);
     ratatui::restore();
@@ -124,6 +162,8 @@ pub async fn run(
         mut events,
     } = conn;
     let mut app = App::new(welcome.download_dir);
+    app.transparent = settings.transparent;
+    app.ask_tags = settings.ask_tags;
     app.set_themes(settings.themes, &settings.theme_name);
     app.has_actions = welcome.has_actions;
     if let Some(n) = welcome.notice {
@@ -136,7 +176,7 @@ pub async fn run(
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     for input in settings.inputs {
-        add(&client, &tx, input);
+        add(&client, &tx, input, Vec::new());
     }
 
     let mut panel_in_flight = false;
@@ -145,6 +185,7 @@ pub async fn run(
     loop {
         // A queued file picker opens once the user is out of other dialogs.
         app.open_next_picker();
+        app.open_next_tag_prompt();
 
         // Keep the file panel's progress fresh: one request at a time, at
         // once for a newly selected torrent and otherwise every second.
@@ -187,20 +228,68 @@ pub async fn run(
                             match action {
                                 Action::Quit => return Ok(Exit::Quit),
                                 Action::StopDaemon => return Ok(Exit::StopDaemon),
-                                Action::Add(input) => {
+                                Action::Add { input, tags } => {
                                     app.clear_status();
-                                    add(&client, &tx, input);
+                                    add(&client, &tx, input, tags);
                                 }
-                                Action::SaveTheme(name) => {
-                                    match config::set_value(&config_path, "theme", &config::yaml_scalar(&name)) {
-                                        Ok(()) => app.set_status(format!("Theme: {name} (saved)"), false),
-                                        Err(e) => app.set_status(format!("Theme applied but not saved: {e:#}"), true),
+                                Action::SaveTheme { name, transparent } => {
+                                    let mut note = format!("Theme: {name}");
+                                    let mut failed = None;
+                                    if let Err(e) = config::set_value(&config_path, "theme", &config::yaml_scalar(&name)) {
+                                        failed = Some(e);
+                                    } else if let Some(on) = transparent {
+                                        note.push_str(if on { ", transparent background" } else { ", theme background" });
+                                        if let Err(e) = config::set_value(&config_path, "transparent_background", &on.to_string()) {
+                                            failed = Some(e);
+                                        }
+                                    }
+                                    match failed {
+                                        None => app.set_status(format!("{note} (saved)"), false),
+                                        Some(e) => app.set_status(format!("{note} applied but not saved: {e:#}"), true),
                                     }
                                 }
                                 Action::SetLimits { download, upload } => {
                                     app.settings_in_flight += 1;
                                     let (client, tx) = (client.clone(), tx.clone());
                                     let req = Request::SetLimits { download: bps(download), upload: bps(upload) };
+                                    tokio::spawn(async move {
+                                        let _ = tx.send(Msg::Setting(client.request_message(req).await));
+                                    });
+                                }
+                                Action::EditConfig => {
+                                    let before = std::fs::read_to_string(&config_path).ok();
+                                    restore_terminal();
+                                    let outcome = run_editor(&config_path);
+                                    terminal = init_terminal()?;
+                                    // The old stream may have swallowed keys meant for the editor.
+                                    term_events = EventStream::new();
+                                    match outcome {
+                                        Err(e) => app.set_status(format!("Editor: {e:#}"), true),
+                                        Ok(()) if std::fs::read_to_string(&config_path).ok() == before => {}
+                                        Ok(()) => match config::load(&config_path) {
+                                            Err(e) => app.set_status(
+                                                format!("The config has an error, fix it before restarting: {e:#}"),
+                                                true,
+                                            ),
+                                            Ok(_) => app.set_status(
+                                                "Config changed: run `torrentui daemon restart` to apply it",
+                                                false,
+                                            ),
+                                        },
+                                    }
+                                }
+                                Action::DeleteTag(tag) => {
+                                    app.settings_in_flight += 1;
+                                    let (client, tx) = (client.clone(), tx.clone());
+                                    let req = Request::DeleteTag { tag };
+                                    tokio::spawn(async move {
+                                        let _ = tx.send(Msg::Setting(client.request_message(req).await));
+                                    });
+                                }
+                                Action::SetHooks(hooks) => {
+                                    app.settings_in_flight += 1;
+                                    let (client, tx) = (client.clone(), tx.clone());
+                                    let req = Request::SetHooks { hooks };
                                     tokio::spawn(async move {
                                         let _ = tx.send(Msg::Setting(client.request_message(req).await));
                                     });
@@ -292,10 +381,29 @@ pub async fn run(
 /// Hand a magnet link, URL or .torrent path to the daemon. Adding a magnet
 /// waits for the swarm, so the daemon does it in the background and reports
 /// back with a notice.
-fn add(client: &Client, tx: &mpsc::UnboundedSender<Msg>, input: String) {
+fn add(client: &Client, tx: &mpsc::UnboundedSender<Msg>, input: String, tags: Vec<String>) {
     let input = engine::prepare_input(&input);
     if input.is_empty() {
         return;
     }
-    spawn_request(client, tx, "Add failed", Request::Add { input });
+    spawn_request(client, tx, "Add failed", Request::Add { input, tags });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn editor_prefers_visual_then_editor_then_vi() {
+        let cmd = |v, e| editor_command(v, e).unwrap();
+        assert_eq!(cmd(Some("nvim"), Some("nano")), ["nvim"]);
+        assert_eq!(cmd(None, Some("code -w")), ["code", "-w"]);
+        assert_eq!(cmd(Some("  "), Some("nano")), ["nano"]);
+        assert_eq!(cmd(None, None), ["vi"]);
+        assert_eq!(
+            cmd(Some("'/Applications/My Editor/ed' --wait"), None),
+            ["/Applications/My Editor/ed", "--wait"]
+        );
+        assert!(editor_command(Some("'oops"), None).is_err());
+    }
 }

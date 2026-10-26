@@ -7,22 +7,24 @@ use ratatui::{
     style::{Color, Style, Stylize},
     text::{Line, Span},
     widgets::{
-        Block, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Sparkline, Table,
-        TableState, Wrap,
+        Block, BorderType, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Sparkline,
+        Table, TableState, Wrap,
     },
 };
 
 use crate::{
+    actions::{self, HookSpec},
     app::{App, Filter, Input, Mode},
     config::Rate,
     engine::{Status, TorrentView},
     fmt,
+    forms::{Field, TagChecklist},
     theme::Theme,
 };
 
 pub fn draw(frame: &mut Frame, app: &App) {
     let t = &app.theme;
-    // Only the foreground is themed; the background is left to the terminal.
+    // The theme's page colour, or the terminal's own when transparent.
     frame.render_widget(Block::new().style(t.base()), frame.area());
 
     let [header, body, footer] = Layout::vertical([
@@ -66,6 +68,11 @@ pub fn draw(frame: &mut Frame, app: &App) {
         Mode::Limits => draw_limits(frame, app),
         Mode::ConfirmStop => draw_confirm_stop(frame, app),
         Mode::Tags => draw_tags(frame, app),
+        Mode::Hooks => draw_hooks(frame, app),
+        Mode::HookEdit => {
+            draw_hooks(frame, app);
+            draw_hook_editor(frame, app);
+        }
         Mode::Filter => draw_filter(frame, app),
         Mode::Help => draw_help(frame, t),
     }
@@ -84,12 +91,39 @@ fn status_color(t: &Theme, s: Status) -> Color {
     }
 }
 
+/// Every pane and popup uses softly rounded corners.
+fn rounded<'a>() -> Block<'a> {
+    Block::bordered().border_type(BorderType::Rounded)
+}
+
 fn block<'a>(t: &Theme) -> Block<'a> {
-    Block::bordered().border_style(Style::new().fg(t.border))
+    rounded().border_style(Style::new().fg(t.border))
 }
 
 fn title<'a>(t: &Theme, text: impl Into<String>) -> Span<'a> {
     Span::styled(text.into(), Style::new().fg(t.accent).bold())
+}
+
+/// A modal's key hints, e.g. `" Enter save  Esc cancel "`: each key in the
+/// accent colour, its meaning muted. Items are separated by two spaces and the
+/// first word of an item is the key.
+fn hint_line<'a>(t: &Theme, hints: &str) -> Line<'a> {
+    let mut spans = vec![Span::styled(" ", t.muted())];
+    for (i, item) in hints.trim().split("  ").enumerate() {
+        if i > 0 {
+            spans.push(Span::styled("  ", t.muted()));
+        }
+        let (k, label) = item.split_once(' ').unwrap_or((item, ""));
+        spans.push(Span::styled(
+            k.to_string(),
+            Style::new().fg(t.accent).bold(),
+        ));
+        if !label.is_empty() {
+            spans.push(Span::styled(format!(" {label}"), t.muted()));
+        }
+    }
+    spans.push(Span::styled(" ", t.muted()));
+    Line::from(spans)
 }
 
 fn key<'a>(t: &Theme, k: &'static str) -> Span<'a> {
@@ -489,26 +523,65 @@ fn draw_input(
 
 fn draw_add(frame: &mut Frame, app: &App) {
     let t = &app.theme;
+    let Some(tags) = &app.add_tags else {
+        return;
+    };
     let full = frame.area();
-    let area = centered(full, full.width.saturating_sub(4).clamp(1, 90), 5);
+    let height = (tags.rows.len() as u16 + 9)
+        .max(11)
+        .min(full.height.saturating_sub(2).max(1));
+    let area = centered(full, full.width.saturating_sub(4).clamp(1, 90), height);
     popup(frame, t, area);
-    let block = Block::bordered()
+    let block = rounded()
         .border_style(Style::new().fg(t.accent))
         .title(title(t, " Add torrent "))
-        .title_bottom(Line::styled(" Enter: add  Esc: cancel ", t.muted()));
+        .title_bottom(hint_line(t, "Enter add  Tab tags  Esc cancel"));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let [hint, field] =
-        Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(inner);
+    let [hint, field, _, label, list_area, err] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
     frame.render_widget(
         Paragraph::new("Magnet link, .torrent URL, or path to a .torrent file (paste works)")
             .style(t.muted()),
         hint,
     );
-    if let Some(pos) = draw_input(frame, t, field, &app.input, "") {
+    let cursor = draw_input(frame, t, field, &app.input, "");
+    if !app.add_focus_tags
+        && let Some(pos) = cursor
+    {
         frame.set_cursor_position(pos);
     }
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                "Tags",
+                if app.add_focus_tags {
+                    Style::new().fg(t.accent).bold()
+                } else {
+                    t.muted()
+                },
+            ),
+            Span::styled("  optional: tick any, or type a new one", t.muted()),
+        ])),
+        label,
+    );
+    let list_inner = Rect {
+        x: list_area.x + 2,
+        width: list_area.width.saturating_sub(2),
+        ..list_area
+    };
+    if let Some(pos) = draw_checklist(frame, t, list_inner, tags, app.add_focus_tags) {
+        frame.set_cursor_position(pos);
+    }
+    draw_checklist_note(frame, t, err, tags, None);
 }
 
 fn draw_confirm(frame: &mut Frame, t: &Theme, name: &str, folder: &str, delete_files: bool) {
@@ -557,7 +630,7 @@ fn draw_confirm(frame: &mut Frame, t: &Theme, name: &str, folder: &str, delete_f
             ],
         )
     };
-    let block = Block::bordered()
+    let block = rounded()
         .border_style(Style::new().fg(if delete_files { t.error } else { t.accent }))
         .title(Span::styled(
             heading,
@@ -592,12 +665,12 @@ fn draw_files(frame: &mut Frame, app: &App) {
     let area = centered(full, width, height);
     popup(frame, t, area);
 
-    let block = Block::bordered()
+    let block = rounded()
         .border_style(Style::new().fg(t.accent))
         .title(title(t, format!(" Select files — {} ", picker.title)))
-        .title_bottom(Line::styled(
-            " Space toggle  a all  n none  i invert  Enter apply  Esc cancel ",
-            t.muted(),
+        .title_bottom(hint_line(
+            t,
+            "Space toggle  a all  n none  i invert  Enter apply  Esc cancel",
         ));
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -655,18 +728,34 @@ fn draw_themes(frame: &mut Frame, app: &App) {
         return;
     };
     let full = frame.area();
-    let height = (app.themes.len() as u16 + 2).clamp(3, full.height.saturating_sub(2).max(3));
+    let height = (app.themes.len() as u16 + 3).clamp(4, full.height.saturating_sub(2).max(4));
     let area = centered(full, full.width.saturating_sub(4).clamp(1, 56), height);
     popup(frame, t, area);
-    let block = Block::bordered()
+    let block = rounded()
         .border_style(Style::new().fg(t.accent))
         .title(title(t, " Theme "))
-        .title_bottom(Line::styled(
-            " ↑↓ preview  Enter save  Esc cancel ",
-            t.muted(),
+        .title_bottom(hint_line(
+            t,
+            "↑↓ preview  b background  Enter save  Esc cancel",
         ));
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    let [bg_row, inner] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("Background  ", t.muted()),
+            Span::styled(
+                if app.transparent {
+                    "transparent (terminal's own)"
+                } else {
+                    "theme colour"
+                },
+                Style::new().fg(t.accent),
+            ),
+        ])),
+        bg_row,
+    );
 
     let name_w = app
         .themes
@@ -703,13 +792,10 @@ fn draw_limits(frame: &mut Frame, app: &App) {
     let full = frame.area();
     let area = centered(full, full.width.saturating_sub(4).clamp(1, 56), 8);
     popup(frame, t, area);
-    let block = Block::bordered()
+    let block = rounded()
         .border_style(Style::new().fg(t.accent))
         .title(title(t, " Speed limits "))
-        .title_bottom(Line::styled(
-            " Tab switch  Enter save  Esc cancel ",
-            t.muted(),
-        ));
+        .title_bottom(hint_line(t, "Tab switch  Enter save  Esc cancel"));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -764,7 +850,7 @@ fn draw_confirm_stop(frame: &mut Frame, app: &App) {
     let full = frame.area();
     let area = centered(full, full.width.saturating_sub(4).clamp(1, 64), 7);
     popup(frame, t, area);
-    let block = Block::bordered()
+    let block = rounded()
         .border_style(Style::new().fg(t.warning))
         .title(Span::styled(
             " Stop the daemon? ",
@@ -823,62 +909,379 @@ fn filter_label(f: &Filter) -> String {
     }
 }
 
+/// A tag checklist: the new-tag field on top, then one `[x] tag (n)` row per
+/// known tag. `active` is whether it has the keyboard; returns where the text
+/// cursor goes when the field has it.
+fn draw_checklist(
+    frame: &mut Frame,
+    t: &Theme,
+    area: Rect,
+    list: &TagChecklist,
+    active: bool,
+) -> Option<Position> {
+    if area.height == 0 || area.width < 4 {
+        return None;
+    }
+    let [field_row, rows_area] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
+    let [mark, field] =
+        Layout::horizontal([Constraint::Length(2), Constraint::Min(1)]).areas(field_row);
+    let on_field = active && list.on_input();
+    frame.render_widget(
+        Paragraph::new("+ ").style(Style::new().fg(t.accent).bold()),
+        mark,
+    );
+    let cursor = draw_input(frame, t, field, &list.input, "new tag (Enter adds it)");
+
+    let height = rows_area.height as usize;
+    if height == 0 {
+        return cursor.filter(|_| on_field);
+    }
+    if list.rows.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No tags yet: type one above").style(t.muted()),
+            rows_area,
+        );
+        return cursor.filter(|_| on_field);
+    }
+    // Keep the highlighted tag in view.
+    let at = list.cursor.saturating_sub(1);
+    let start = (at + 1).saturating_sub(height);
+    let lines: Vec<Line> = list
+        .rows
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(height)
+        .map(|(i, row)| {
+            let here = active && list.cursor == i + 1;
+            let count = if row.count > 0 {
+                format!(" ({})", row.count)
+            } else {
+                String::new()
+            };
+            let text = format!(
+                "{} [{}] {}{}",
+                if here { "▶" } else { " " },
+                if row.checked { "x" } else { " " },
+                fit(&row.name, (rows_area.width as usize).saturating_sub(10)),
+                count
+            );
+            if here {
+                Line::styled(text, Style::new().bg(t.selection_bg).bold())
+            } else if row.checked {
+                Line::styled(text, Style::new().fg(t.accent))
+            } else {
+                Line::raw(text)
+            }
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), rows_area);
+    cursor.filter(|_| on_field)
+}
+
+/// The line under a checklist: a pending delete's question, else an error.
+fn draw_checklist_note(
+    frame: &mut Frame,
+    t: &Theme,
+    area: Rect,
+    list: &TagChecklist,
+    other_error: Option<&String>,
+) {
+    let (text, color) = if let Some(tag) = &list.confirm_delete {
+        let n = list
+            .rows
+            .iter()
+            .find(|r| &r.name == tag)
+            .map_or(0, |r| r.count);
+        (
+            format!("Delete #{tag} from {n} torrent(s) and all actions? y / n"),
+            t.warning,
+        )
+    } else if let Some(e) = other_error.or(list.error.as_ref()) {
+        (e.clone(), t.error)
+    } else {
+        return;
+    };
+    frame.render_widget(
+        Paragraph::new(fit(&text, area.width as usize)).style(Style::new().fg(color)),
+        area,
+    );
+}
+
 fn draw_tags(frame: &mut Frame, app: &App) {
     let t = &app.theme;
     let Some(editor) = &app.tag_editor else {
         return;
     };
     let full = frame.area();
-    let width = full.width.saturating_sub(4).clamp(1, 70);
-    let area = centered(full, width, 9);
+    let width = full.width.saturating_sub(4).clamp(1, 60);
+    let height = (editor.list.rows.len() as u16 + 6)
+        .max(9)
+        .min(full.height.saturating_sub(2).max(1));
+    let area = centered(full, width, height);
     popup(frame, t, area);
-    let block = Block::bordered()
+    let block = rounded()
         .border_style(Style::new().fg(t.accent))
         .title(title(
             t,
             format!(
-                " Tags — {} ",
-                fit(&editor.name, (width as usize).saturating_sub(12))
+                " {} — {} ",
+                if editor.prompt {
+                    "Tag new torrent"
+                } else {
+                    "Tags"
+                },
+                fit(&editor.name, (width as usize).saturating_sub(24))
             ),
         ))
-        .title_bottom(Line::styled(" Enter save  Esc cancel ", t.muted()));
+        .title_bottom(hint_line(
+            t,
+            "Space toggle  Enter save  Del delete tag  Esc cancel",
+        ));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let [hint, field, _, in_use, err] = Layout::vertical([
+    let [list_area, err] =
+        Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
+    if let Some(pos) = draw_checklist(frame, t, list_area, &editor.list, true) {
+        frame.set_cursor_position(pos);
+    }
+    draw_checklist_note(frame, t, err, &editor.list, None);
+}
+
+/// `name → command [tags]` for one action in the list.
+fn hook_summary(h: &HookSpec) -> String {
+    let command = actions::join_command(&h.run);
+    let tags = if h.tags.is_empty() {
+        "all torrents".to_string()
+    } else {
+        h.tags
+            .iter()
+            .map(|t| format!("#{t}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    match &h.name {
+        Some(n) => format!("{n}  —  {command}  [{tags}]"),
+        None => format!("{command}  [{tags}]"),
+    }
+}
+
+fn draw_hooks(frame: &mut Frame, app: &App) {
+    let t = &app.theme;
+    let Some(manager) = &app.hook_manager else {
+        return;
+    };
+    let full = frame.area();
+    let width = full.width.saturating_sub(4).clamp(1, 96);
+    let height = (app.hooks.len() as u16 + 6)
+        .max(10)
+        .min(full.height.saturating_sub(2).max(1));
+    let area = centered(full, width, height);
+    popup(frame, t, area);
+    let hint = if manager.confirm_delete {
+        " y delete  n cancel "
+    } else {
+        " a add  Enter edit  d delete  Esc close "
+    };
+    let block = rounded()
+        .border_style(Style::new().fg(t.accent))
+        .title(title(t, " Actions when a download finishes "))
+        .title_bottom(hint_line(t, hint));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let [intro, list_area, note] = Layout::vertical([
         Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(2),
+        Constraint::Min(1),
         Constraint::Length(1),
     ])
     .areas(inner);
     frame.render_widget(
-        Paragraph::new("Separate with spaces or commas; empty removes all").style(t.muted()),
-        hint,
+        Paragraph::new("Runs when a torrent finishes. With tags: only for torrents that have one.")
+            .style(t.muted())
+            .wrap(Wrap { trim: true }),
+        intro,
     );
-    if let Some(pos) = draw_input(frame, t, field, &editor.input, "e.g. movies 4k sci-fi") {
+    if app.hooks.is_empty() {
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(""),
+                Line::from("No actions yet.").centered(),
+                Line::from(vec![
+                    Span::raw("Press "),
+                    key(t, "a"),
+                    Span::raw(" to add one."),
+                ])
+                .centered(),
+            ]),
+            list_area,
+        );
+    } else {
+        let rows = list_area.height as usize;
+        let start = (manager.cursor + 1).saturating_sub(rows);
+        let lines: Vec<Line> = app
+            .hooks
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(rows)
+            .map(|(i, h)| {
+                let text = format!(
+                    "{} {}",
+                    if i == manager.cursor { "▶" } else { " " },
+                    fit(
+                        &hook_summary(h),
+                        (list_area.width as usize).saturating_sub(2)
+                    )
+                );
+                if i == manager.cursor {
+                    Line::styled(text, Style::new().bg(t.selection_bg).bold())
+                } else {
+                    Line::raw(text)
+                }
+            })
+            .collect();
+        frame.render_widget(Paragraph::new(lines), list_area);
+    }
+    if manager.confirm_delete
+        && let Some(h) = app.hooks.get(manager.cursor)
+    {
+        let label = h
+            .name
+            .clone()
+            .unwrap_or_else(|| actions::join_command(&h.run));
+        frame.render_widget(
+            Paragraph::new(fit(
+                &format!("Delete \"{label}\"? It is removed from your config too."),
+                note.width as usize,
+            ))
+            .style(Style::new().fg(t.warning)),
+            note,
+        );
+    }
+}
+
+fn draw_hook_editor(frame: &mut Frame, app: &App) {
+    let t = &app.theme;
+    let Some(editor) = &app.hook_editor else {
+        return;
+    };
+    let full = frame.area();
+    let width = full.width.saturating_sub(4).clamp(1, 80);
+    let height = full.height.saturating_sub(2).clamp(1, 22);
+    let area = centered(full, width, height);
+    popup(frame, t, area);
+    let block = rounded()
+        .border_style(Style::new().fg(t.accent))
+        .title(title(
+            t,
+            if editor.index.is_some() {
+                " Edit action "
+            } else {
+                " New action "
+            },
+        ))
+        .title_bottom(hint_line(
+            t,
+            "Tab next field  Enter save  Del delete tag  Esc cancel",
+        ));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let [name, command, subst, timeout, tags_label, tags, err] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+
+    let label = |text: &'static str, field: Field| {
+        let style = if editor.focus == field {
+            Style::new().fg(t.accent).bold()
+        } else {
+            t.muted()
+        };
+        Span::styled(format!("{text:<9}"), style)
+    };
+    let row = |frame: &mut Frame,
+               area: Rect,
+               field: Field,
+               text: &'static str,
+               input: &Input,
+               hint: &str| {
+        let [l, f] = Layout::horizontal([Constraint::Length(9), Constraint::Min(1)]).areas(area);
+        frame.render_widget(Paragraph::new(label(text, field)), l);
+        let pos = draw_input(frame, t, f, input, hint);
+        if editor.focus == field
+            && let Some(pos) = pos
+        {
+            frame.set_cursor_position(pos);
+        }
+    };
+    row(
+        frame,
+        name,
+        Field::Name,
+        "Name",
+        &editor.name,
+        "optional label",
+    );
+    row(
+        frame,
+        command,
+        Field::Command,
+        "Command",
+        &editor.command,
+        "~/bin/sort.sh \"{path}\" \"{tags}\"",
+    );
+    frame.render_widget(
+        Paragraph::new("{path} {name} {hash} {tags} are filled in; no shell is used")
+            .style(t.muted()),
+        Rect {
+            x: subst.x + 9,
+            width: subst.width.saturating_sub(9),
+            ..subst
+        },
+    );
+    row(
+        frame,
+        timeout,
+        Field::Timeout,
+        "Timeout",
+        &editor.timeout,
+        "seconds, 0 = no limit",
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            label("Tags", Field::Tags),
+            Span::styled(
+                "only torrents with a ticked tag run it; none = all",
+                t.muted(),
+            ),
+        ])),
+        tags_label,
+    );
+    let tags_inner = Rect {
+        x: tags.x + 2,
+        width: tags.width.saturating_sub(2),
+        ..tags
+    };
+    if let Some(pos) = draw_checklist(
+        frame,
+        t,
+        tags_inner,
+        &editor.tags,
+        editor.focus == Field::Tags,
+    ) {
         frame.set_cursor_position(pos);
     }
-    if !editor.in_use.is_empty() {
-        let list: Vec<String> = editor
-            .in_use
-            .iter()
-            .map(|(tag, n)| format!("{tag} ({n})"))
-            .collect();
-        frame.render_widget(
-            Paragraph::new(format!("In use: {}", list.join(", ")))
-                .style(t.muted())
-                .wrap(Wrap { trim: true }),
-            in_use,
-        );
-    }
-    if let Some(e) = &editor.error {
-        frame.render_widget(
-            Paragraph::new(fit(e, err.width as usize)).style(Style::new().fg(t.error)),
-            err,
-        );
-    }
+    draw_checklist_note(frame, t, err, &editor.tags, editor.error.as_ref());
 }
 
 fn draw_filter(frame: &mut Frame, app: &App) {
@@ -890,13 +1293,10 @@ fn draw_filter(frame: &mut Frame, app: &App) {
     let height = (picker.entries.len() as u16 + 2).clamp(3, full.height.saturating_sub(2).max(3));
     let area = centered(full, full.width.saturating_sub(4).clamp(1, 44), height);
     popup(frame, t, area);
-    let block = Block::bordered()
+    let block = rounded()
         .border_style(Style::new().fg(t.accent))
         .title(title(t, " Filter by tag "))
-        .title_bottom(Line::styled(
-            " ↑↓ choose  Enter apply  Esc cancel ",
-            t.muted(),
-        ));
+        .title_bottom(hint_line(t, "↑↓ choose  Enter apply  Esc cancel"));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -925,7 +1325,7 @@ fn draw_filter(frame: &mut Frame, app: &App) {
 
 fn draw_help(frame: &mut Frame, t: &Theme) {
     let rows = [
-        ("a", "Add a magnet link, .torrent URL or file"),
+        ("a", "Add a magnet link, .torrent URL or file (Tab: tags)"),
         ("p / Space", "Pause or resume selected torrent"),
         ("f / Enter", "Choose which files to download"),
         ("F", "Show / hide the per-file progress panel"),
@@ -933,9 +1333,15 @@ fn draw_help(frame: &mut Frame, t: &Theme) {
         ("d / Del", "Remove torrent, keep files (asks first)"),
         ("D", "Remove torrent and DELETE its data (asks first)"),
         ("x", "Run on_complete actions on a finished torrent"),
-        ("t", "Edit tags of the selected torrent"),
+        ("t", "Add or remove tags on the selected torrent"),
+        ("Del", "In the tag list: delete the tag everywhere"),
+        ("A", "Manage the on-complete actions"),
+        ("E", "Edit the config file in $VISUAL / $EDITOR"),
         ("/", "Filter the list by tag (Esc shows all)"),
-        ("T", "Pick a colour theme (saved)"),
+        (
+            "T",
+            "Pick a colour theme; b toggles a transparent background",
+        ),
         ("l", "Set download / upload speed limits (saved)"),
         ("↑ ↓ / j k", "Move selection"),
         ("g / G", "Jump to first / last"),
@@ -1293,15 +1699,23 @@ mod tests {
     }
 
     #[test]
-    fn tag_editor_popup_shows_input_suggestions_and_errors() {
+    fn tag_editor_popup_shows_checklist_field_and_errors() {
         let mut app = App::new("/dl".into());
         tagged(&mut app);
         app.handle_key(key(KeyCode::Char('t')));
         let out = render(&app, 100, 30);
         assert!(out.contains("Tags — alpha.iso"), "{out}");
-        assert!(out.contains("iso linux"));
-        assert!(out.contains("In use: iso (1), linux (1)"));
-        app.handle_key(key(KeyCode::Char('!')));
+        assert!(out.contains("new tag"), "{out}");
+        assert!(
+            out.contains("[x] iso (1)") && out.contains("[x] linux (1)"),
+            "{out}"
+        );
+        assert!(out.contains("Space toggle"));
+        app.handle_key(key(KeyCode::Char(' ')));
+        assert!(render(&app, 100, 30).contains("[ ] iso (1)"), "unticked");
+        for c in "bad!".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
         app.handle_key(key(KeyCode::Enter));
         assert!(render(&app, 100, 30).contains("contains '!'"));
     }
@@ -1539,5 +1953,258 @@ mod tests {
         assert!(app.panel_files.is_none(), "answer for another torrent");
         app.handle_key(key(KeyCode::Char('F')));
         assert_eq!(app.panel_wanted(), None);
+    }
+
+    fn a_hook(name: &str, tags: &[&str]) -> crate::actions::HookSpec {
+        crate::actions::HookSpec {
+            name: Some(name.into()),
+            run: vec!["~/bin/sort.sh".into(), "{path}".into(), "two words".into()],
+            tags: tags.iter().map(|t| t.to_string()).collect(),
+            timeout_secs: 600,
+        }
+    }
+
+    #[test]
+    fn actions_manager_lists_actions_and_confirms_delete() {
+        let mut app = App::new("/dl".into());
+        app.handle_key(key(KeyCode::Char('A')));
+        let empty = render(&app, 100, 30);
+        assert!(
+            empty.contains("No actions yet") && empty.contains("a add"),
+            "{empty}"
+        );
+        app.hooks = vec![a_hook("sort movies", &["movies", "4k"]), {
+            let mut h = a_hook("x", &[]);
+            h.name = None;
+            h
+        }];
+        let out = render(&app, 100, 30);
+        assert!(
+            out.contains("sort movies  —  ~/bin/sort.sh {path} 'two words'  [#movies #4k]"),
+            "{out}"
+        );
+        assert!(out.contains("[all torrents]"), "{out}");
+        assert!(out.contains("Enter edit"));
+        app.handle_key(key(KeyCode::Char('d')));
+        let out = render(&app, 100, 30);
+        assert!(
+            out.contains("Delete \"sort movies\"?") && out.contains("y delete"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn action_editor_shows_fields_and_a_tag_checklist() {
+        let mut app = App::new("/dl".into());
+        tagged(&mut app);
+        app.hooks = vec![a_hook("sort", &["linux"])];
+        app.handle_key(key(KeyCode::Char('A')));
+        app.handle_key(key(KeyCode::Enter));
+        let out = render(&app, 100, 30);
+        for want in [
+            "Edit action",
+            "Name",
+            "sort",
+            "Command",
+            "~/bin/sort.sh {path} 'two words'",
+            "Timeout",
+            "600",
+            "Tags",
+            "[x] linux (1)",
+            "[ ] iso (1)",
+            "Tab next field",
+        ] {
+            assert!(out.contains(want), "{want} missing: {out}");
+        }
+        // A bad command shows its reason in the form.
+        app.handle_key(key(KeyCode::Tab));
+        for _ in 0..40 {
+            app.handle_key(key(KeyCode::Backspace));
+        }
+        app.handle_key(key(KeyCode::Enter));
+        assert!(render(&app, 100, 30).contains("the command is required"));
+        // New action starts empty.
+        app.handle_key(key(KeyCode::Esc));
+        app.handle_key(key(KeyCode::Char('a')));
+        assert!(render(&app, 100, 30).contains("New action"));
+    }
+
+    #[test]
+    fn action_dialogs_survive_tiny_terminals_and_keep_the_background() {
+        let mut app = App::new("/dl".into());
+        app.set_themes(crate::theme::builtin_themes(), "dracula");
+        tagged(&mut app);
+        app.hooks = vec![a_hook("sort", &["linux"])];
+        app.handle_key(key(KeyCode::Char('A')));
+        for step in 0..2 {
+            for (w, h) in [(0, 0), (1, 1), (10, 3), (20, 8), (40, 12)] {
+                render(&app, w, h);
+            }
+            let (_, buf) = render_buf(&app, 100, 30);
+            for y in 0..30 {
+                for x in 0..100 {
+                    let c = buf[(x, y)].bg;
+                    assert!(
+                        c == Color::Reset || c == app.theme.selection_bg,
+                        "({x},{y}) {c:?} step {step}"
+                    );
+                }
+            }
+            app.handle_key(key(KeyCode::Enter));
+        }
+    }
+
+    #[test]
+    fn tag_delete_asks_with_the_torrent_count() {
+        let mut app = App::new("/dl".into());
+        tagged(&mut app);
+        app.handle_key(key(KeyCode::Char('t')));
+        app.handle_key(key(KeyCode::Delete));
+        let out = render(&app, 100, 30);
+        assert!(
+            out.contains("Delete #iso from 1 torrent(s) and all actions? y / n"),
+            "{out}"
+        );
+        assert!(out.contains("Del delete tag"));
+    }
+
+    #[test]
+    fn opaque_themes_paint_their_background_everywhere_including_modals() {
+        let mut app = App::new("/dl".into());
+        app.transparent = false;
+        app.set_themes(crate::theme::builtin_themes(), "nord");
+        tagged(&mut app);
+        app.hooks = vec![a_hook("sort", &["linux"])];
+        let page = app.theme.bg;
+        assert_eq!(page, Color::Rgb(0x2e, 0x34, 0x40));
+        let modals: [&[KeyCode]; 7] = [
+            &[],
+            &[KeyCode::Char('?')],
+            &[KeyCode::Char('a')],
+            &[KeyCode::Char('T')],
+            &[KeyCode::Char('t')],
+            &[KeyCode::Char('A')],
+            &[KeyCode::Char('A'), KeyCode::Enter],
+        ];
+        for keys in modals {
+            let mut app_with = App::new("/dl".into());
+            app_with.transparent = false;
+            app_with.set_themes(crate::theme::builtin_themes(), "nord");
+            tagged(&mut app_with);
+            app_with.hooks = app.hooks.clone();
+            for k in keys {
+                app_with.handle_key(key(*k));
+            }
+            let (_, buf) = render_buf(&app_with, 100, 30);
+            for y in 0..30 {
+                for x in 0..100 {
+                    let bg = buf[(x, y)].bg;
+                    assert!(
+                        bg == page || bg == app_with.theme.selection_bg,
+                        "({x},{y}) {bg:?} after {keys:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn theme_picker_shows_and_toggles_the_background_setting() {
+        let mut app = App::new("/dl".into());
+        app.set_themes(crate::theme::builtin_themes(), "dracula");
+        assert_eq!(render_buf(&app, 80, 30).1[(0, 0)].bg, Color::Reset);
+        app.handle_key(key(KeyCode::Char('T')));
+        let out = render(&app, 80, 30);
+        assert!(out.contains("Background  transparent"), "{out}");
+        assert!(out.contains("b background"), "{out}");
+        app.handle_key(key(KeyCode::Char('b')));
+        let (out, buf) = render_buf(&app, 80, 30);
+        assert!(out.contains("Background  theme colour"), "{out}");
+        assert_eq!(
+            buf[(0, 0)].bg,
+            Color::Rgb(0x28, 0x2a, 0x36),
+            "previewed live"
+        );
+        // Esc puts it back.
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(render_buf(&app, 80, 30).1[(0, 0)].bg, Color::Reset);
+        // The default theme has no background of its own to show.
+        app.set_themes(crate::theme::builtin_themes(), "default");
+        app.set_transparent(false);
+        assert_eq!(render_buf(&app, 60, 20).1[(0, 0)].bg, Color::Reset);
+    }
+
+    #[test]
+    fn modal_keybinds_are_drawn_in_the_accent_colour() {
+        let mut app = App::new("/dl".into());
+        app.set_themes(crate::theme::builtin_themes(), "dracula");
+        tagged(&mut app);
+        app.hooks = vec![a_hook("sort", &["linux"])];
+        let accent = app.theme.accent;
+        let cases: [(&[KeyCode], &str); 7] = [
+            (&[KeyCode::Char('a')], "Enter"),
+            (&[KeyCode::Char('T')], "Enter"),
+            (&[KeyCode::Char('l')], "Tab"),
+            (&[KeyCode::Char('t')], "Space"),
+            (&[KeyCode::Char('/')], "Enter"),
+            (&[KeyCode::Char('A')], "Enter"),
+            (&[KeyCode::Char('A'), KeyCode::Enter], "Tab"),
+        ];
+        for (keys, word) in cases {
+            let mut app = App::new("/dl".into());
+            app.set_themes(crate::theme::builtin_themes(), "dracula");
+            tagged(&mut app);
+            app.hooks = vec![a_hook("sort", &["linux"])];
+            for k in keys {
+                app.handle_key(key(*k));
+            }
+            let (text, buf) = render_buf(&app, 120, 40);
+            // The hint is on a border row: find the word on a row that also
+            // has a border corner, then check its colour and the label's.
+            let (y, line) = text
+                .lines()
+                .enumerate()
+                .find(|(_, l)| (l.contains('└') || l.contains('╰')) && l.contains(word))
+                .unwrap_or_else(|| panic!("no hint with {word} after {keys:?}:\n{text}"));
+            let x = line[..line.find(word).unwrap()].chars().count() as u16;
+            assert_eq!(buf[(x, y as u16)].fg, accent, "{word} after {keys:?}");
+            let label_x = x + word.chars().count() as u16 + 1;
+            assert_eq!(
+                buf[(label_x, y as u16)].fg,
+                app.theme.muted,
+                "label after {keys:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn add_dialog_has_a_tag_list_and_new_torrents_get_a_prompt_title() {
+        let mut app = App::new("/dl".into());
+        tagged(&mut app);
+        app.handle_key(key(KeyCode::Char('a')));
+        let out = render(&app, 100, 30);
+        assert!(
+            out.contains("Add torrent") && out.contains("Magnet link"),
+            "{out}"
+        );
+        assert!(out.contains("Tags  optional"), "{out}");
+        assert!(
+            out.contains("[ ] iso (1)") && out.contains("[ ] linux (1)"),
+            "{out}"
+        );
+        assert!(out.contains("Tab tags"), "{out}");
+        app.handle_key(key(KeyCode::Esc));
+
+        app.ask_tags = true;
+        let mut c = sample();
+        c.id = 3;
+        c.name = "charlie.iso".into();
+        c.info_hash = "h3".into();
+        let mut all: Vec<_> = app.torrents.clone();
+        all.push(c);
+        app.update_torrents(all);
+        app.open_next_tag_prompt();
+        let out = render(&app, 100, 30);
+        assert!(out.contains("Tag new torrent — charlie.iso"), "{out}");
     }
 }

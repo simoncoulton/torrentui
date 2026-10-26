@@ -6,6 +6,7 @@ mod daemon;
 mod desktop;
 mod engine;
 mod fmt;
+mod forms;
 mod macos;
 mod proto;
 mod tags;
@@ -285,6 +286,7 @@ async fn open(args: &OpenArgs) -> Result<()> {
         conn.client
             .request(Request::Add {
                 input: input.clone(),
+                tags: Vec::new(),
             })
             .await
             .wrap_err_with(|| format!("cannot add {input}"))?;
@@ -304,8 +306,19 @@ async fn open(args: &OpenArgs) -> Result<()> {
 async fn run_tui(args: TuiArgs) -> Result<ExitCode> {
     let config_path = config_path(&args.config)?;
     let cfg = config::load(&config_path)?;
-    let themes = theme::all_themes(&cfg.themes)
-        .wrap_err_with(|| format!("invalid themes in {}", config_path.display()))?;
+    // Built-ins are written out as files on first run, then everything in the
+    // themes folder next to the config is offered.
+    let themes_dir = config_path
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .join("themes");
+    let themes = theme::load_themes(&themes_dir, &cfg.themes).wrap_err_with(|| {
+        format!(
+            "invalid themes (config {} or folder {})",
+            config_path.display(),
+            themes_dir.display()
+        )
+    })?;
 
     if args.list_themes {
         for t in &themes {
@@ -361,6 +374,8 @@ async fn run_tui(args: TuiArgs) -> Result<ExitCode> {
             config_path,
             themes,
             theme_name,
+            transparent: cfg.transparent_background,
+            ask_tags: cfg.ask_tags,
             inputs: args.inputs,
         },
     )
