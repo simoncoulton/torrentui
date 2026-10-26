@@ -1,6 +1,10 @@
 //! The terminal UI: one window attached to the daemon.
 
-use std::{num::NonZeroU32, path::PathBuf, time::Duration};
+use std::{
+    num::NonZeroU32,
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
 use color_eyre::eyre::Result;
 use crossterm::{
@@ -54,7 +58,15 @@ enum Msg {
         name: String,
         result: Result<(FileList, Vec<usize>)>,
     },
+    /// Fresh per-file progress for the side panel.
+    PanelFiles {
+        id: usize,
+        result: Result<(FileList, Vec<usize>)>,
+    },
 }
+
+/// How often the side panel refreshes its per-file progress.
+const PANEL_REFRESH: Duration = Duration::from_secs(1);
 
 /// Enter the alternate screen / raw mode. `ratatui::init` also installs a panic
 /// hook that restores the terminal; we extend it to undo bracketed paste.
@@ -127,9 +139,33 @@ pub async fn run(
         add(&client, &tx, input);
     }
 
+    let mut panel_in_flight = false;
+    let mut panel_fetched = Instant::now();
+
     loop {
         // A queued file picker opens once the user is out of other dialogs.
         app.open_next_picker();
+
+        // Keep the file panel's progress fresh: one request at a time, at
+        // once for a newly selected torrent and otherwise every second.
+        if let Some(id) = app.panel_wanted()
+            && !panel_in_flight
+            && (app.panel_files.as_ref().is_none_or(|p| p.id != id)
+                || panel_fetched.elapsed() >= PANEL_REFRESH)
+        {
+            panel_in_flight = true;
+            panel_fetched = Instant::now();
+            let (client, tx) = (client.clone(), tx.clone());
+            tokio::spawn(async move {
+                let result = match client.request(Request::Files { id }).await {
+                    Ok(crate::proto::Reply::Files { list, selected }) => Ok((list, selected)),
+                    Ok(other) => Err(color_eyre::eyre::eyre!("unexpected reply: {other:?}")),
+                    Err(e) => Err(e),
+                };
+                let _ = tx.send(Msg::PanelFiles { id, result });
+            });
+        }
+
         terminal.draw(|f| ui::draw(f, &app))?;
 
         tokio::select! {
@@ -240,6 +276,14 @@ pub async fn run(
                     )),
                     Err(e) => app.set_status(format!("Cannot list files: {e:#}"), true),
                 },
+                Msg::PanelFiles { id, result } => {
+                    panel_in_flight = false;
+                    // Metadata may not be resolved yet; the panel says so and
+                    // the next refresh tries again.
+                    if let Ok((list, selected)) = result {
+                        app.set_panel_files(id, list, selected);
+                    }
+                }
             },
         }
     }

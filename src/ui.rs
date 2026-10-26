@@ -25,17 +25,31 @@ pub fn draw(frame: &mut Frame, app: &App) {
     // Only the foreground is themed; the background is left to the terminal.
     frame.render_widget(Block::new().style(t.base()), frame.area());
 
-    let [header, list, details, footer] = Layout::vertical([
+    let [header, body, footer] = Layout::vertical([
         Constraint::Length(3),
-        Constraint::Min(5),
-        Constraint::Length(10),
+        Constraint::Min(15),
         Constraint::Length(1),
     ])
     .areas(frame.area());
 
+    // The file panel needs room: on a narrow terminal it stays closed.
+    let (main, panel) = if app.file_panel && body.width >= PANEL_MIN_TERMINAL {
+        let width = (body.width * 2 / 5).clamp(32, 70);
+        let [main, panel] =
+            Layout::horizontal([Constraint::Min(30), Constraint::Length(width)]).areas(body);
+        (main, Some(panel))
+    } else {
+        (body, None)
+    };
+    let [list, details] =
+        Layout::vertical([Constraint::Min(5), Constraint::Length(10)]).areas(main);
+
     draw_header(frame, app, header);
     draw_list(frame, app, list);
     draw_details(frame, app, details);
+    if let Some(panel) = panel {
+        draw_file_panel(frame, app, panel);
+    }
     draw_footer(frame, app, footer);
 
     match &app.mode {
@@ -50,12 +64,15 @@ pub fn draw(frame: &mut Frame, app: &App) {
         Mode::Files => draw_files(frame, app),
         Mode::Theme => draw_themes(frame, app),
         Mode::Limits => draw_limits(frame, app),
-        Mode::ConfirmStop => draw_confirm_stop(frame, t),
+        Mode::ConfirmStop => draw_confirm_stop(frame, app),
         Mode::Tags => draw_tags(frame, app),
         Mode::Filter => draw_filter(frame, app),
         Mode::Help => draw_help(frame, t),
     }
 }
+
+/// Narrowest terminal that still gets a file panel.
+const PANEL_MIN_TERMINAL: u16 = 90;
 
 fn status_color(t: &Theme, s: Status) -> Color {
     match s {
@@ -239,6 +256,63 @@ fn draw_details(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 
+/// The right-hand panel: every file of the selected torrent with its own
+/// download progress.
+fn draw_file_panel(frame: &mut Frame, app: &App, area: Rect) {
+    let t = &app.theme;
+    let mut block = block(t).title(title(t, " Files "));
+    let message = |text: &str| Paragraph::new(Span::styled(text.to_string(), t.muted()));
+    let inner = block.inner(area);
+    let Some(id) = app.panel_wanted() else {
+        frame.render_widget(block, area);
+        return;
+    };
+    let Some(files) = app.panel_files.as_ref().filter(|p| p.id == id) else {
+        frame.render_widget(block, area);
+        frame.render_widget(message("Loading…"), inner);
+        return;
+    };
+
+    let entries = &files.list.entries;
+    let rows = inner.height as usize;
+    // Page keys can overshoot; stop at the last full page.
+    let start = app.panel_scroll.min(entries.len().saturating_sub(rows));
+    if entries.len() > rows {
+        let end = (start + rows).min(entries.len());
+        block = block.title_bottom(Span::styled(
+            format!(" {}-{} of {} (PgUp/PgDn) ", start + 1, end, entries.len()),
+            t.muted(),
+        ));
+    }
+    // " 100%" is the right column; a space separates it from the name.
+    const PCT_W: usize = 4;
+    let name_w = (inner.width as usize).saturating_sub(PCT_W + 1);
+    let lines: Vec<Line> = entries
+        .iter()
+        .skip(start)
+        .take(rows)
+        .map(|f| {
+            let name = format!("{:<name_w$} ", fit(&f.path, name_w));
+            if !files.selected.contains(&f.index) {
+                return Line::styled(format!("{name}{:>PCT_W$}", "skip"), t.muted());
+            }
+            // Whole percent, rounded down: 100% means the file is complete.
+            let pct = (f.done * 100).checked_div(f.len).unwrap_or(100);
+            let style = match pct {
+                100 => Style::new().fg(t.success),
+                0 => t.muted(),
+                _ => Style::new().fg(t.warning),
+            };
+            Line::from(vec![
+                Span::raw(name),
+                Span::styled(format!("{:>PCT_W$}", format!("{pct}%")), style),
+            ])
+        })
+        .collect();
+    frame.render_widget(block, area);
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
 fn detail_lines(t: &Theme, tor: &TorrentView, tags: &[String]) -> Vec<Line<'static>> {
     let label = |s: &'static str| Span::styled(format!("{s:<10}"), t.muted());
     let ratio = if tor.total_bytes > 0 {
@@ -337,21 +411,34 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
                 1,
             ),
             ("f", "files", 1),
-            ("T", "tags", 1),
+            (
+                "F",
+                if app.file_panel {
+                    "hide panel"
+                } else {
+                    "file panel"
+                },
+                1,
+            ),
+            ("t", "tags", 1),
             ("/", "filter", 1),
             ("d", "remove", 1),
             ("x", "actions", 1),
-            ("t", "theme", 2),
             ("l", "limits", 2),
-            ("Q", "stop daemon", 2),
-            ("?", "help", 0),
+            ("T", "theme", 2),
             ("q", "quit", 0),
+            ("Q", "quit + daemon", 2),
+            ("?", "help", 0),
         ];
         if app.filter != Filter::All {
             hints.insert(0, ("Esc", "show all", 0));
         }
         if !app.has_actions {
             hints.retain(|h| h.0 != "x");
+        }
+        // These act on the selected torrent, so they mean nothing without one.
+        if app.current().is_none() {
+            hints.retain(|h| !matches!(h.0, "p" | "f" | "F" | "t" | "d" | "x"));
         }
         let badge = actions_badge(t, app);
         let badge_w: usize = badge.iter().map(|s| s.content.chars().count()).sum();
@@ -682,7 +769,8 @@ fn draw_limits(frame: &mut Frame, app: &App) {
     }
 }
 
-fn draw_confirm_stop(frame: &mut Frame, t: &Theme) {
+fn draw_confirm_stop(frame: &mut Frame, app: &App) {
+    let t = &app.theme;
     let full = frame.area();
     let area = centered(full, full.width.saturating_sub(4).clamp(1, 64), 7);
     popup(frame, t, area);
@@ -692,12 +780,20 @@ fn draw_confirm_stop(frame: &mut Frame, t: &Theme) {
             " Stop the daemon? ",
             Style::new().fg(t.warning).bold(),
         ));
-    let lines = vec![
-        Line::from("Downloads are in progress."),
-        Line::styled(
+    let (headline, detail) = if app.is_busy() {
+        (
+            "Downloads are in progress.",
             "Stopping pauses them and ends post-download actions.",
-            t.muted(),
-        ),
+        )
+    } else {
+        (
+            "This closes the window and stops the daemon.",
+            "Nothing will download or seed until torrentui runs again.",
+        )
+    };
+    let lines = vec![
+        Line::from(headline),
+        Line::styled(detail, t.muted()),
         Line::from(""),
         Line::from(vec![
             key(t, "y"),
@@ -842,12 +938,14 @@ fn draw_help(frame: &mut Frame, t: &Theme) {
         ("a", "Add a magnet link, .torrent URL or file"),
         ("p / Space", "Pause or resume selected torrent"),
         ("f / Enter", "Choose which files to download"),
+        ("F", "Show / hide the per-file progress panel"),
+        ("PgUp / PgDn", "Scroll the file panel"),
         ("d / Del", "Remove torrent, keep files (asks first)"),
         ("D", "Remove torrent and DELETE its data (asks first)"),
         ("x", "Run on_complete actions on a finished torrent"),
-        ("T", "Edit tags of the selected torrent"),
+        ("t", "Edit tags of the selected torrent"),
         ("/", "Filter the list by tag (Esc shows all)"),
-        ("t", "Pick a colour theme (saved)"),
+        ("T", "Pick a colour theme (saved)"),
         ("l", "Set download / upload speed limits (saved)"),
         ("↑ ↓ / j k", "Move selection"),
         ("g / G", "Jump to first / last"),
@@ -1062,7 +1160,7 @@ mod tests {
             state: KeyEventState::NONE,
         };
         let mut app = App::new("/dl".into());
-        app.handle_key(key(KeyCode::Char('t')));
+        app.handle_key(key(KeyCode::Char('T')));
         let out = render(&app, 100, 30);
         assert!(out.contains("Theme"));
         assert!(out.contains("tokyo-night"));
@@ -1208,7 +1306,7 @@ mod tests {
     fn tag_editor_popup_shows_input_suggestions_and_errors() {
         let mut app = App::new("/dl".into());
         tagged(&mut app);
-        app.handle_key(key(KeyCode::Char('T')));
+        app.handle_key(key(KeyCode::Char('t')));
         let out = render(&app, 100, 30);
         assert!(out.contains("Tags — alpha.iso"), "{out}");
         assert!(out.contains("iso linux"));
@@ -1223,7 +1321,7 @@ mod tests {
         let mut app = App::new("/dl".into());
         app.set_themes(crate::theme::builtin_themes(), "dracula");
         tagged(&mut app);
-        for open in ['T', '/'] {
+        for open in ['t', '/'] {
             app.handle_key(key(KeyCode::Char(open)));
             let (_, buf) = render_buf(&app, 100, 30);
             for y in 0..30 {
@@ -1241,7 +1339,8 @@ mod tests {
 
     #[test]
     fn footer_drops_low_priority_hints_when_narrow() {
-        let app = App::new("/dl".into());
+        let mut app = App::new("/dl".into());
+        app.update_torrents(vec![sample()]);
         let last = |w: u16, h: u16| {
             render(&app, w, h)
                 .lines()
@@ -1267,7 +1366,7 @@ mod tests {
     fn tag_dialogs_survive_tiny_terminals() {
         let mut app = App::new("/dl".into());
         tagged(&mut app);
-        for open in ['T', '/'] {
+        for open in ['t', '/'] {
             app.handle_key(key(KeyCode::Char(open)));
             for (w, h) in [(0, 0), (1, 1), (10, 3), (20, 8), (40, 12)] {
                 render(&app, w, h);
@@ -1279,6 +1378,7 @@ mod tests {
     #[test]
     fn footer_shows_actions_hint_and_running_badge() {
         let mut app = App::new("/dl".into());
+        app.update_torrents(vec![sample()]);
         let footer = |app: &App, w: u16| {
             render(app, w, 30)
                 .lines()
@@ -1334,8 +1434,19 @@ mod tests {
     fn footer_offers_unpause_for_a_paused_torrent() {
         let mut app = App::new("/dl".into());
         let footer = |app: &App| render(app, 120, 30).lines().last().unwrap().to_string();
-        assert!(footer(&app).contains("p pause"), "no torrent selected");
+        let empty = footer(&app);
+        assert!(empty.contains("a add") && empty.contains("T theme") && empty.contains("? help"));
+        for gone in ["pause", "files", "tags", "remove"] {
+            assert!(
+                !empty.contains(gone),
+                "{gone} shown with no torrent: {empty}"
+            );
+        }
         app.update_torrents(vec![sample()]);
+        let full = footer(&app);
+        for shown in ["p pause", "f files", "t tags", "d remove"] {
+            assert!(full.contains(shown), "{shown} missing: {full}");
+        }
         assert!(footer(&app).contains("p pause") && !footer(&app).contains("unpause"));
         let mut paused = sample();
         paused.status = Status::Paused;
@@ -1347,5 +1458,97 @@ mod tests {
         app.update_torrents(vec![sample(), other]);
         app.handle_key(key(KeyCode::Char('k')));
         assert!(footer(&app).contains("p pause") && !footer(&app).contains("unpause"));
+    }
+
+    fn panel_files(done: [u64; 3]) -> crate::engine::FileList {
+        use crate::engine::{FileEntry, FileList};
+        FileList {
+            entries: ["a/movie.mkv", "a/subs.srt", "a/extra.nfo"]
+                .iter()
+                .zip(done)
+                .enumerate()
+                .map(|(index, (path, done))| FileEntry {
+                    index,
+                    path: path.to_string(),
+                    len: 200,
+                    done,
+                })
+                .collect(),
+            padding: vec![],
+        }
+    }
+
+    #[test]
+    fn file_panel_shows_per_file_progress() {
+        let mut app = App::new("/dl".into());
+        app.update_torrents(vec![sample()]);
+        assert!(
+            !render(&app, 120, 30).contains("Files"),
+            "closed by default"
+        );
+
+        app.handle_key(key(KeyCode::Char('F')));
+        assert!(render(&app, 120, 30).contains("Loading"));
+
+        // File 2 is not selected, file 1 is complete, file 0 half done.
+        app.set_panel_files(1, panel_files([100, 200, 0]), vec![0, 1]);
+        let out = render(&app, 120, 30);
+        assert!(out.contains("a/movie.mkv") && out.contains("50%"), "{out}");
+        assert!(out.contains("a/subs.srt") && out.contains("100%"), "{out}");
+        assert!(out.contains("a/extra.nfo") && out.contains("skip"), "{out}");
+        assert!(out.contains("hide panel"));
+
+        // Too narrow for a panel: the list keeps the room.
+        assert!(!render(&app, 80, 30).contains("a/movie.mkv"));
+
+        app.handle_key(key(KeyCode::Char('F')));
+        assert!(!render(&app, 120, 30).contains("a/movie.mkv"));
+    }
+
+    #[test]
+    fn file_panel_rounds_down_and_scrolls() {
+        use crate::engine::{FileEntry, FileList};
+        let mut app = App::new("/dl".into());
+        app.update_torrents(vec![sample()]);
+        app.handle_key(key(KeyCode::Char('F')));
+        let list = FileList {
+            entries: (0..60)
+                .map(|index| FileEntry {
+                    index,
+                    path: format!("file-{index:02}"),
+                    len: 1000,
+                    done: if index == 0 { 999 } else { 0 },
+                })
+                .collect(),
+            padding: vec![],
+        };
+        app.set_panel_files(1, list, (0..60).collect());
+        let top = render(&app, 120, 30);
+        assert!(top.contains("file-00") && top.contains(" 99%"), "{top}");
+        assert!(!top.contains("file-59"));
+        app.handle_key(key(KeyCode::PageDown));
+        app.handle_key(key(KeyCode::PageDown));
+        app.handle_key(key(KeyCode::PageDown));
+        app.handle_key(key(KeyCode::PageDown));
+        app.handle_key(key(KeyCode::PageDown));
+        app.handle_key(key(KeyCode::PageDown));
+        let bottom = render(&app, 120, 30);
+        assert!(
+            bottom.contains("file-59") && !bottom.contains("file-00"),
+            "{bottom}"
+        );
+    }
+
+    #[test]
+    fn file_panel_ignores_answers_for_other_torrents() {
+        let mut app = App::new("/dl".into());
+        app.update_torrents(vec![sample()]);
+        app.set_panel_files(1, panel_files([0, 0, 0]), vec![0]);
+        assert!(app.panel_files.is_none(), "closed panel stores nothing");
+        app.handle_key(key(KeyCode::Char('F')));
+        app.set_panel_files(7, panel_files([0, 0, 0]), vec![0]);
+        assert!(app.panel_files.is_none(), "answer for another torrent");
+        app.handle_key(key(KeyCode::Char('F')));
+        assert_eq!(app.panel_wanted(), None);
     }
 }

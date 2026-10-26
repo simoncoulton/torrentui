@@ -273,6 +273,15 @@ pub struct FilterPicker {
     pub cursor: usize,
 }
 
+/// Per-file progress of one torrent, shown in the side panel.
+#[derive(Debug, Clone)]
+pub struct PanelFiles {
+    pub id: usize,
+    pub list: FileList,
+    /// Indices of the files the torrent is downloading.
+    pub selected: HashSet<usize>,
+}
+
 pub struct App {
     pub mode: Mode,
     pub input: Input,
@@ -308,6 +317,11 @@ pub struct App {
     view: Vec<usize>,
     pub tag_editor: Option<TagEditor>,
     pub filter_picker: Option<FilterPicker>,
+    /// Whether the per-file progress panel is open (`F`).
+    pub file_panel: bool,
+    pub panel_files: Option<PanelFiles>,
+    /// First file row shown in the panel.
+    pub panel_scroll: usize,
 }
 
 impl App {
@@ -339,7 +353,31 @@ impl App {
             view: Vec::new(),
             tag_editor: None,
             filter_picker: None,
+            file_panel: false,
+            panel_files: None,
+            panel_scroll: 0,
         }
+    }
+
+    /// The torrent whose files the panel needs, if it is open.
+    pub fn panel_wanted(&self) -> Option<usize> {
+        self.file_panel.then(|| self.current().map(|t| t.id))?
+    }
+
+    /// Store a fresh file list; one for a torrent that is no longer selected
+    /// (the answer arrived late) is dropped.
+    pub fn set_panel_files(&mut self, id: usize, list: FileList, selected: Vec<usize>) {
+        if self.panel_wanted() != Some(id) {
+            return;
+        }
+        if self.panel_files.as_ref().is_none_or(|p| p.id != id) {
+            self.panel_scroll = 0;
+        }
+        self.panel_files = Some(PanelFiles {
+            id,
+            list,
+            selected: selected.into_iter().collect(),
+        });
     }
 
     /// Install the available themes and make `current` (by name) active.
@@ -568,28 +606,26 @@ impl App {
         }
     }
 
+    /// Whether stopping the daemon would interrupt something.
+    pub fn is_busy(&self) -> bool {
+        self.pending_adds > 0
+            || self.actions_running > 0
+            || self
+                .torrents
+                .iter()
+                .any(|t| matches!(t.status, Status::Downloading | Status::Initializing))
+    }
+
     fn key_normal(&mut self, key: KeyEvent) -> Option<Action> {
         match key.code {
             KeyCode::Char('q') => return Some(Action::Quit),
-            KeyCode::Char('Q') => {
-                let busy = self.pending_adds > 0
-                    || self.actions_running > 0
-                    || self
-                        .torrents
-                        .iter()
-                        .any(|t| matches!(t.status, Status::Downloading | Status::Initializing));
-                if busy {
-                    self.mode = Mode::ConfirmStop;
-                } else {
-                    return Some(Action::StopDaemon);
-                }
-            }
+            KeyCode::Char('Q') => self.mode = Mode::ConfirmStop,
             KeyCode::Char('a') => {
                 self.input.clear();
                 self.mode = Mode::Add;
             }
             KeyCode::Char('?') | KeyCode::F(1) => self.mode = Mode::Help,
-            KeyCode::Char('t') => {
+            KeyCode::Char('T') => {
                 self.theme_picker = Some(ThemePicker {
                     cursor: self.theme_index,
                     original: self.theme_index,
@@ -613,8 +649,17 @@ impl App {
                 self.mode = Mode::Limits;
             }
             KeyCode::Char('x') => return self.run_actions_key(),
-            KeyCode::Char('T') => self.open_tag_editor(),
+            KeyCode::Char('t') => self.open_tag_editor(),
             KeyCode::Char('/') => self.open_filter_picker(),
+            KeyCode::Char('F') => {
+                self.file_panel = !self.file_panel;
+                self.panel_files = None;
+                self.panel_scroll = 0;
+            }
+            KeyCode::PageDown if self.file_panel => self.panel_scroll += 10,
+            KeyCode::PageUp if self.file_panel => {
+                self.panel_scroll = self.panel_scroll.saturating_sub(10)
+            }
             KeyCode::Esc if self.filter != Filter::All => {
                 self.filter = Filter::All;
                 self.refresh_view();
@@ -1325,7 +1370,7 @@ mod tests {
     fn theme_picker_previews_saves_and_cancels() {
         let mut app = themed_app();
         assert_eq!(app.theme.name, "default");
-        app.handle_key(key(KeyCode::Char('t')));
+        app.handle_key(key(KeyCode::Char('T')));
         assert_eq!(app.mode, Mode::Theme);
         app.handle_key(key(KeyCode::Down));
         let previewed = app.theme.name.clone();
@@ -1337,7 +1382,7 @@ mod tests {
         assert_eq!(app.mode, Mode::Normal);
 
         // confirm keeps it and asks for it to be saved
-        app.handle_key(key(KeyCode::Char('t')));
+        app.handle_key(key(KeyCode::Char('T')));
         app.handle_key(key(KeyCode::Down));
         app.handle_key(key(KeyCode::Down));
         let chosen = app.theme.name.clone();
@@ -1348,7 +1393,7 @@ mod tests {
         assert_eq!(app.theme.name, chosen);
 
         // reopening starts on the current theme; cancel keeps it
-        app.handle_key(key(KeyCode::Char('t')));
+        app.handle_key(key(KeyCode::Char('T')));
         assert_eq!(app.theme_picker.as_ref().unwrap().cursor, 2);
         app.handle_key(key(KeyCode::Down));
         app.handle_key(key(KeyCode::Esc));
@@ -1358,7 +1403,7 @@ mod tests {
     #[test]
     fn theme_picker_cursor_is_bounded() {
         let mut app = themed_app();
-        app.handle_key(key(KeyCode::Char('t')));
+        app.handle_key(key(KeyCode::Char('T')));
         for _ in 0..50 {
             app.handle_key(key(KeyCode::Down));
         }
@@ -1499,7 +1544,7 @@ mod tests {
     fn tag_editor_saves_normalised_tags() {
         let mut app = App::new(String::new());
         app.update_torrents(vec![tview(1)]);
-        app.handle_key(key(KeyCode::Char('T')));
+        app.handle_key(key(KeyCode::Char('t')));
         assert_eq!(app.mode, Mode::Tags);
         app.handle_paste("Movies, #4K  movies\n");
         let a = app.handle_key(key(KeyCode::Enter));
@@ -1517,7 +1562,7 @@ mod tests {
     #[test]
     fn tag_editor_starts_with_current_tags_and_empty_clears() {
         let mut app = tagged_app();
-        app.handle_key(key(KeyCode::Char('T')));
+        app.handle_key(key(KeyCode::Char('t')));
         assert_eq!(app.tag_editor.as_ref().unwrap().input.text(), "4k movies");
         let in_use = &app.tag_editor.as_ref().unwrap().in_use;
         assert_eq!(in_use, &[("4k".to_string(), 1), ("movies".to_string(), 2)]);
@@ -1537,7 +1582,7 @@ mod tests {
     #[test]
     fn tag_editor_rejects_bad_tags_and_stays_open() {
         let mut app = tagged_app();
-        app.handle_key(key(KeyCode::Char('T')));
+        app.handle_key(key(KeyCode::Char('t')));
         type_str(&mut app, " bad!");
         assert_eq!(app.handle_key(key(KeyCode::Enter)), None);
         assert_eq!(app.mode, Mode::Tags);
@@ -1563,7 +1608,7 @@ mod tests {
     #[test]
     fn typing_command_letters_in_the_tag_editor_does_not_trigger_them() {
         let mut app = tagged_app();
-        app.handle_key(key(KeyCode::Char('T')));
+        app.handle_key(key(KeyCode::Char('t')));
         assert_eq!(app.handle_key(key(KeyCode::Char('q'))), None);
         type_str(&mut app, "dT/");
         assert_eq!(app.mode, Mode::Tags);
@@ -1572,7 +1617,7 @@ mod tests {
     #[test]
     fn tag_editor_needs_a_torrent() {
         let mut app = App::new(String::new());
-        app.handle_key(key(KeyCode::Char('T')));
+        app.handle_key(key(KeyCode::Char('t')));
         assert_eq!(app.mode, Mode::Normal);
     }
 
@@ -1654,7 +1699,7 @@ mod tests {
         app.refresh_view();
         assert_eq!(visible_ids(&app), [1]);
         // Removing the only "4k" tag empties the filter, which resets itself.
-        app.handle_key(key(KeyCode::Char('T')));
+        app.handle_key(key(KeyCode::Char('t')));
         app.handle_key(key(KeyCode::Char('u')).with_ctrl());
         type_str(&mut app, "movies");
         app.handle_key(key(KeyCode::Enter));
@@ -1795,19 +1840,21 @@ mod tests {
     }
 
     #[test]
-    fn capital_q_stops_the_daemon_asking_only_when_busy() {
+    fn capital_q_always_asks_before_stopping_the_daemon() {
         let mut app = App::new(String::new());
         app.update_torrents(vec![TorrentView {
             status: Status::Seeding,
             ..tview(1)
         }]);
-        assert_eq!(
-            app.handle_key(key(KeyCode::Char('Q'))),
-            Some(Action::StopDaemon)
-        );
+        assert!(!app.is_busy());
+        assert_eq!(app.handle_key(key(KeyCode::Char('Q'))), None);
+        assert_eq!(app.mode, Mode::ConfirmStop);
+        assert_eq!(app.handle_key(key(KeyCode::Char('n'))), None);
+        assert_eq!(app.mode, Mode::Normal);
 
-        // Downloading: asks first, and only `y` confirms.
+        // Downloading: still asks, and only `y` confirms.
         app.update_torrents(vec![tview(1)]);
+        assert!(app.is_busy());
         assert_eq!(app.handle_key(key(KeyCode::Char('Q'))), None);
         assert_eq!(app.mode, Mode::ConfirmStop);
         for k in [KeyCode::Enter, KeyCode::Char('x'), KeyCode::Char('Q')] {

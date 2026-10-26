@@ -45,17 +45,18 @@ files, so a few bytes of an unselected neighbour may still be written.
 | `a` | Add magnet / URL / file |
 | `p`, `Space` | Pause / resume |
 | `f`, `Enter` | Choose which files to download |
+| `F` | Show / hide a side panel with each file's download progress (`PgUp`/`PgDn` scroll it) |
 | `d`, `Del` | Remove the torrent, keep its files (asks first) |
 | `D` | Remove the torrent **and delete its data** (asks first) |
 | `x` | Run the `on_complete` actions on a finished torrent |
-| `T` | Edit the selected torrent's tags |
+| `t` | Edit the selected torrent's tags |
 | `/` | Filter the list by tag (`Esc` shows everything again) |
-| `t` | Theme picker with live preview (saved) |
+| `T` | Theme picker with live preview (saved) |
 | `l` | Speed limits (saved) |
 | `↑↓`, `j k`, `g G` | Navigate |
 | `?` | Help |
 | `q`, `Ctrl-C` | Close the window; the daemon keeps running |
-| `Q` | Close the window and stop the daemon |
+| `Q` | Close the window and stop the daemon (asks first) |
 
 ## How it runs
 
@@ -68,7 +69,7 @@ running your [post-download actions](#actions-after-a-download).
   limits and torrents are shared; selection, filter and theme preview are per
   window.
 - `q` closes the window and leaves the daemon running. `Q` also stops the
-  daemon (it asks first if downloads are in progress).
+  daemon (it always asks first).
 - `torrentui daemon stop` stops it from anywhere and waits until it has saved
   its state; `restart` is how config changes (`download_dir`, `on_complete`, the
   peer limit, `dht`, `ask_files`) take effect. `status` shows whether it is
@@ -215,7 +216,7 @@ also want to delete the stale line from `~/.config/mimeapps.list`.
 
 ## Tags
 
-Press `T` on a torrent to tag it, e.g. `movies 4k sci-fi`. Separate tags with
+Press `t` on a torrent to tag it, e.g. `movies 4k sci-fi`. Separate tags with
 spaces or commas; a leading `#` is ignored and tags are lowercased. Tags may
 contain letters, digits and `- _ . /` (so write `tv-shows`, not `tv shows`), up
 to 32 characters, at most 16 per torrent. The editor lists the tags already in
@@ -298,7 +299,7 @@ dht: true                     # trackerless peer discovery (needed for most magn
 ask_files: true               # show the file picker for multi-file torrents
 ```
 
-`t` and `l` inside the app write `theme`, `max_download_speed` and
+`T` and `l` inside the app write `theme`, `max_download_speed` and
 `max_upload_speed` back to this file. Only those lines change; your comments
 and everything else are left alone, and a symlinked config (e.g. managed by
 stow) stays a symlink. `download_dir`, `peer_limit` and `dht` take effect on the
