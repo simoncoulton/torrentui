@@ -321,12 +321,12 @@ themes:
   my-theme:
     base: dracula
     accent: "#ff79c6"
-    bg: "#101010"
+    fg: "#f8f8f2"
 ```
 
-Colour keys: `bg fg muted accent border selection_bg success info warning error special`
+Colour keys: `fg muted accent border selection_bg success info warning error special`
 (`success` = downloading, `info` = seeding/upload, `warning` = paused,
-`special` = checking). Set `bg: reset` to keep your terminal's background.
+`special` = checking). Themes never set a background, so terminal transparency is preserved.
 
 ## Where data lives
 

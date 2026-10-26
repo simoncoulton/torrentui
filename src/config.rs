@@ -70,8 +70,8 @@ notify: true
 #   my-theme:
 #     base: dracula
 #     accent: \"#ff79c6\"
-#     bg: \"#101010\"
-#   # Keys: bg fg muted accent border selection_bg success info warning error special
+#     fg: \"#f8f8f2\"
+#   # Keys: fg muted accent border selection_bg success info warning error special
 ";
 
 #[derive(Debug, Clone, Deserialize)]

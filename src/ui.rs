@@ -22,7 +22,7 @@ use crate::{
 
 pub fn draw(frame: &mut Frame, app: &App) {
     let t = &app.theme;
-    // Paint the whole window first so the theme background fills every cell.
+    // Only the foreground is themed; the background is left to the terminal.
     frame.render_widget(Block::new().style(t.base()), frame.area());
 
     let [header, list, details, footer] = Layout::vertical([
@@ -79,8 +79,7 @@ fn key<'a>(t: &Theme, k: &'static str) -> Span<'a> {
     Span::styled(k, Style::new().fg(t.accent).bold())
 }
 
-/// Clear a popup area and repaint the theme background (a bare `Clear` would
-/// reset it to the terminal default).
+/// Clear a popup area and restore the theme's base style.
 fn popup(frame: &mut Frame, t: &Theme, area: Rect) {
     frame.render_widget(Clear, area);
     frame.render_widget(Block::new().style(t.base()), area);
@@ -946,12 +945,10 @@ mod tests {
     }
 
     #[test]
-    fn theme_background_fills_everything_including_popups() {
+    fn themes_never_set_a_background() {
         let mut app = App::new("/dl".into());
-        let themes = crate::theme::builtin_themes();
-        app.set_themes(themes, "tokyo-night");
+        app.set_themes(crate::theme::builtin_themes(), "tokyo-night");
         app.update_torrents(vec![sample()]);
-        let bg = app.theme.bg;
         for mode in [Mode::Normal, Mode::Help, Mode::Add] {
             app.mode = mode;
             let (_, buf) = render_buf(&app, 100, 30);
@@ -960,7 +957,7 @@ mod tests {
                     // The selected row legitimately uses the selection colour.
                     let cell_bg = buf[(x, y)].bg;
                     assert!(
-                        cell_bg == bg || cell_bg == app.theme.selection_bg,
+                        cell_bg == Color::Reset || cell_bg == app.theme.selection_bg,
                         "cell ({x},{y}) in {:?} has bg {cell_bg:?}",
                         app.mode
                     );
@@ -1222,11 +1219,10 @@ mod tests {
     }
 
     #[test]
-    fn tag_popups_fill_the_theme_background() {
+    fn tag_popups_keep_terminal_background() {
         let mut app = App::new("/dl".into());
         app.set_themes(crate::theme::builtin_themes(), "dracula");
         tagged(&mut app);
-        let bg = app.theme.bg;
         for open in ['T', '/'] {
             app.handle_key(key(KeyCode::Char(open)));
             let (_, buf) = render_buf(&app, 100, 30);
@@ -1234,7 +1230,7 @@ mod tests {
                 for x in 0..100 {
                     let c = buf[(x, y)].bg;
                     assert!(
-                        c == bg || c == app.theme.selection_bg,
+                        c == Color::Reset || c == app.theme.selection_bg,
                         "({x},{y}) {c:?} after {open}"
                     );
                 }

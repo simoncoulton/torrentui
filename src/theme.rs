@@ -11,8 +11,6 @@ use serde::Deserialize;
 #[derive(Debug, Clone, PartialEq)]
 pub struct Theme {
     pub name: String,
-    /// Window background. `Color::Reset` keeps the terminal's own background.
-    pub bg: Color,
     pub fg: Color,
     /// Secondary text: hints, labels, empty cells.
     pub muted: Color,
@@ -34,7 +32,7 @@ pub struct Theme {
 
 impl Theme {
     pub fn base(&self) -> Style {
-        Style::new().fg(self.fg).bg(self.bg)
+        Style::new().fg(self.fg)
     }
 
     pub fn muted(&self) -> Style {
@@ -68,22 +66,21 @@ fn rgb(hex: u32) -> Color {
     Color::Rgb((hex >> 16) as u8, (hex >> 8) as u8, hex as u8)
 }
 
-/// `c` is: bg, fg, muted, accent, border, selection_bg, success, info,
+/// `c` is: fg, muted, accent, border, selection_bg, success, info,
 /// warning, error, special.
-fn preset(name: &str, c: [u32; 11]) -> Theme {
+fn preset(name: &str, c: [u32; 10]) -> Theme {
     Theme {
         name: name.to_string(),
-        bg: rgb(c[0]),
-        fg: rgb(c[1]),
-        muted: rgb(c[2]),
-        accent: rgb(c[3]),
-        border: rgb(c[4]),
-        selection_bg: rgb(c[5]),
-        success: rgb(c[6]),
-        info: rgb(c[7]),
-        warning: rgb(c[8]),
-        error: rgb(c[9]),
-        special: rgb(c[10]),
+        fg: rgb(c[0]),
+        muted: rgb(c[1]),
+        accent: rgb(c[2]),
+        border: rgb(c[3]),
+        selection_bg: rgb(c[4]),
+        success: rgb(c[5]),
+        info: rgb(c[6]),
+        warning: rgb(c[7]),
+        error: rgb(c[8]),
+        special: rgb(c[9]),
     }
 }
 
@@ -91,7 +88,6 @@ fn preset(name: &str, c: [u32; 11]) -> Theme {
 pub fn default_theme() -> Theme {
     Theme {
         name: "default".into(),
-        bg: Color::Reset,
         fg: Color::Reset,
         muted: Color::DarkGray,
         accent: Color::Cyan,
@@ -113,35 +109,35 @@ pub fn builtin_themes() -> Vec<Theme> {
         preset(
             "tokyo-night",
             [
-                0x1a1b26, 0xc0caf5, 0x565f89, 0x7aa2f7, 0x3b4261, 0x283457, 0x9ece6a, 0x7dcfff,
+                0xc0caf5, 0x565f89, 0x7aa2f7, 0x3b4261, 0x283457, 0x9ece6a, 0x7dcfff,
                 0xe0af68, 0xf7768e, 0xbb9af7,
             ],
         ),
         preset(
             "catppuccin-frappe",
             [
-                0x303446, 0xc6d0f5, 0x737994, 0x8caaee, 0x51576d, 0x51576d, 0xa6d189, 0x85c1dc,
+                0xc6d0f5, 0x737994, 0x8caaee, 0x51576d, 0x51576d, 0xa6d189, 0x85c1dc,
                 0xe5c890, 0xe78284, 0xca9ee6,
             ],
         ),
         preset(
             "catppuccin-mocha",
             [
-                0x1e1e2e, 0xcdd6f4, 0x6c7086, 0x89b4fa, 0x45475a, 0x45475a, 0xa6e3a1, 0x74c7ec,
+                0xcdd6f4, 0x6c7086, 0x89b4fa, 0x45475a, 0x45475a, 0xa6e3a1, 0x74c7ec,
                 0xf9e2af, 0xf38ba8, 0xcba6f7,
             ],
         ),
         preset(
             "dracula",
             [
-                0x282a36, 0xf8f8f2, 0x6272a4, 0xbd93f9, 0x44475a, 0x44475a, 0x50fa7b, 0x8be9fd,
+                0xf8f8f2, 0x6272a4, 0xbd93f9, 0x44475a, 0x44475a, 0x50fa7b, 0x8be9fd,
                 0xf1fa8c, 0xff5555, 0xff79c6,
             ],
         ),
         preset(
             "one-dark",
             [
-                0x282c34, 0xabb2bf, 0x5c6370, 0x61afef, 0x4b5263, 0x3e4451, 0x98c379, 0x56b6c2,
+                0xabb2bf, 0x5c6370, 0x61afef, 0x4b5263, 0x3e4451, 0x98c379, 0x56b6c2,
                 0xe5c07b, 0xe06c75, 0xc678dd,
             ],
         ),
@@ -170,6 +166,8 @@ pub fn normalize(name: &str) -> String {
 #[serde(deny_unknown_fields)]
 pub struct ThemeSpec {
     pub base: Option<String>,
+    /// Ignored: themes never set a background so terminal transparency works.
+    #[allow(dead_code)]
     pub bg: Option<String>,
     pub fg: Option<String>,
     pub muted: Option<String>,
@@ -205,7 +203,6 @@ impl ThemeSpec {
         };
         Ok(Theme {
             name: name.to_string(),
-            bg: color(name, "bg", &self.bg, base.bg)?,
             fg: color(name, "fg", &self.fg, base.fg)?,
             muted: color(name, "muted", &self.muted, base.muted)?,
             accent: color(name, "accent", &self.accent, base.accent)?,
@@ -276,7 +273,7 @@ mod tests {
     fn spot_check_palettes() {
         let all = builtin_themes();
         let t = find(&all, "tokyo-night").unwrap();
-        assert_eq!(t.bg, Color::Rgb(0x1a, 0x1b, 0x26));
+        assert_eq!(t.fg, Color::Rgb(0xc0, 0xca, 0xf5));
         let m = find(&all, "catppuccin-mocha").unwrap();
         assert_eq!(m.error, Color::Rgb(0xf3, 0x8b, 0xa8));
         let d = find(&all, "dracula").unwrap();
@@ -299,7 +296,7 @@ mod tests {
         let t = find(&all, "mine").unwrap();
         assert_eq!(t.accent, Color::Rgb(255, 0, 0));
         assert_eq!(t.error, Color::Magenta);
-        assert_eq!(t.bg, Color::Rgb(0x28, 0x2a, 0x36)); // from dracula
+        assert_eq!(t.fg, Color::Rgb(0xf8, 0xf8, 0xf2)); // from dracula
     }
 
     #[test]
