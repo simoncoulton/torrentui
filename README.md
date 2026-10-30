@@ -8,19 +8,30 @@ A terminal BitTorrent client built on [ratatui](https://ratatui.rs) and the
 The demo downloads two of the free, freely licensed films from
 [webtorrent.io/free-torrents](https://webtorrent.io/free-torrents).
 
-## Install
+## Installation
 
-Requires Rust 1.89 or newer.
+### macOS (Homebrew)
 
+Homebrew on macOS (Apple Silicon and Intel) is the supported way to install, with prebuilt binaries:
+
+```sh
+brew tap simoncoulton/torrentui https://github.com/simoncoulton/torrentui
+brew install torrentui
 ```
-cargo install --git https://github.com/simoncoulton/torrentui   # or, from a checkout:
-cargo install --path .                                          # installs ~/.cargo/bin/torrentui
+
+### Arch Linux and other distributions
+
+There is no package for Arch or its derivatives yet. Build from source with a recent
+[Rust toolchain](https://rustup.rs) (1.89 or newer):
+
+```sh
+git clone https://github.com/simoncoulton/torrentui
+cd torrentui
+cargo install --path .       # installs ~/.cargo/bin/torrentui
 ```
 
-Prebuilt Linux and macOS (Intel and Apple Silicon) binaries are attached to each
-[GitHub release](https://github.com/simoncoulton/torrentui/releases); unpack the
-archive and put `torrentui` on your `PATH`. Linux and macOS are supported; there
-is no Windows version.
+Linux and macOS are supported; there is no Windows version.
+
 
 ## Usage
 
@@ -79,7 +90,7 @@ running your [post-download actions](#actions-after-a-download).
   daemon (it always asks first).
 - `torrentui daemon stop` stops it from anywhere and waits until it has saved
   its state; `restart` is how config changes (`download_dir`, `on_complete`, the
-  peer limit, `dht`, `ask_files`) take effect. `status` shows whether it is
+  peer limit, `dht`, `ask_files`, `cleanup_skipped`, `remove_on_complete`) take effect. `status` shows whether it is
   running (exit code 3 if not).
 - `-d` and `--all-files` apply when the command starts the daemon; if it is
   already running with other settings you get an error telling you to
@@ -159,6 +170,15 @@ macOS it builds a small handler app. [macOS notes](#macos) are below.
   picker; **the first answer wins** and the others close theirs. With no window
   open it waits, and notifies you, until you open one. Set `ask_files: false` to
   download everything without asking.
+- A skipped file can still appear on disk: pieces are shared between
+  neighbouring files, so a small `.nfo` next to a selected video is written along
+  with it. Set `cleanup_skipped: true` and the daemon deletes the skipped files
+  (and folders left empty) once the torrent finishes. Off by default, since it
+  deletes files.
+- Set `remove_on_complete: true` to stop seeding: when a torrent finishes, its
+  `on_complete` actions run first, then it is removed from the list (the files
+  stay). If an action fails the torrent is kept. `cleanup_skipped` runs before
+  the actions. Manual runs (`x`) never remove.
 - To have a link also open a terminal when no window is attached, register with
   `--ui`: `torrentui register --ui`. The terminal is detected (`$TERMINAL`, then
   ghostty, kitty, alacritty, foot, wezterm, gnome-terminal, konsole, xterm);
@@ -321,6 +341,8 @@ max_upload_speed: 500KiB/s    #   "/s" optional; 0 = unlimited. Bits (Mbps) are 
 peer_limit: 0                 # max peers per torrent; 0 = engine default
 dht: true                     # trackerless peer discovery (needed for most magnets)
 ask_files: true               # show the file picker for multi-file torrents
+cleanup_skipped: false        # delete files skipped in the picker once a torrent finishes
+remove_on_complete: false      # remove a torrent (keeping files) when it finishes, after its on_complete actions
 ask_tags: true                # offer tags for torrents that arrive from a browser/another window
 transparent_background: true  # false paints the theme's own background (toggle: T, then b)
 ```

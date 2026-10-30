@@ -11,7 +11,7 @@ keywords = ["bittorrent", "torrent", "tui", "terminal", "magnet"]
 categories = ["command-line-utilities"]
 # let-chains (1.88) and File::try_lock (1.89)
 rust-version = "1.89"
-exclude = [".github/", "packaging/"]
+exclude = [".github/", "packaging/", "Formula/", "scripts/"]
 
 [dependencies]
 clap = { version = "4.6.7", features = ["derive"] }
