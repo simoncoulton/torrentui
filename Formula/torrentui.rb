@@ -7,22 +7,22 @@ class Torrentui < Formula
   on_macos do
     on_arm do
       url "https://github.com/simoncoulton/torrentui/releases/download/v0.1.0/torrentui-v0.1.0-aarch64-apple-darwin.tar.gz"
-      sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+      sha256 "1a6d2b11300c665cdf1a6c5b3436549bfe7bc143012790cd5038784c6e1fb7a5"
     end
     on_intel do
       url "https://github.com/simoncoulton/torrentui/releases/download/v0.1.0/torrentui-v0.1.0-x86_64-apple-darwin.tar.gz"
-      sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+      sha256 "911aa8dbec179db6f8c38aa54f330fddfb781e4ed4c517cd1f8a4154c5ea4851"
     end
   end
 
   on_linux do
     on_arm do
       url "https://github.com/simoncoulton/torrentui/releases/download/v0.1.0/torrentui-v0.1.0-aarch64-unknown-linux-gnu.tar.gz"
-      sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+      sha256 "5862855adf5b292dd081495e23c5816f3c77ac213418b8ad94a330d70c937c7b"
     end
     on_intel do
       url "https://github.com/simoncoulton/torrentui/releases/download/v0.1.0/torrentui-v0.1.0-x86_64-unknown-linux-gnu.tar.gz"
-      sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+      sha256 "cc8c4d610fbee6190038cc88b469de197b427589b658ecc0adeed4dae5f88564"
     end
   end
 
